@@ -1,0 +1,3967 @@
+//+------------------------------------------------------------------+
+//|                  ScalpingFixed_EA_v9_Exness_XAUUSD.mq5          |
+//|         Version 9.7 - Multi-Ordres Micro + Gestion Avancée      |
+//|  4+ Ordres simultanés par opportunité avec gestion indépendante |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Exness Optimized - XAUUSD"
+#property link      "https://www.mql5.com"
+#property version   "9.70"
+#property strict
+#property description "EA de scalping optimisé pour XAUUSD sur Exness"
+#property description "Multi-Ordres Micro: 4+ positions simultanées gérées"
+#property description "SL Dynamique indépendant par position"
+#property description "Gestion des lots par grille proportionnelle"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- INPUTS : GESTION DU RISQUE
+input double RiskPercent          = 0.5;    // [1.0->0.5] Report: DD 99% - risque divisé par 2 pour absorber
+
+//--- NOUVEAU: GESTION DU SOLDE COURANT
+input bool   UseCurrentBalanceForRisk = true;
+input bool   ShowCurrentBalanceInDashboard = true;
+
+//--- INPUTS : SL DYNAMIQUE PAR OPPORTUNITÉ
+enum ENUM_SL_METHOD
+{
+   SL_ATR_ADAPTIVE,
+   SL_SWING_POINTS,
+   SL_SUPPORT_RESISTANCE,
+   SL_HYBRID
+};
+input ENUM_SL_METHOD SL_Method = SL_HYBRID;
+input double SL_ATR_MinMultiplier = 0.4;    // [0.5->0.4] Report: SL moy 234pts sur pertes - resserrer
+input double SL_ATR_MaxMultiplier = 1.0;    // [1.2->1.0] cap SL pour limiter avg_loss (-5.35$)
+input int    SL_Swing_Lookback = 10;
+input int    SL_Min_Distance = 30;          // [40->30]
+input int    SL_Max_Distance = 180;         // [250->180] Report: SL max 330pts - capper à 180
+input bool   SL_Use_Volatility_Adjustment = true;
+
+//--- INPUTS : DISTANCE MINIMALE
+input int    MinDistPoints        = 100;
+
+//--- INPUTS : SCAN CONTINU SL RAPIDE [trailing a perdu -2917$, on le durcit]
+input bool   UseRapidSLMovement     = true;
+input int    RapidSLTrigger         = 30;   // [40->30] déclencher plus tôt
+input int    RapidSLStep            = 20;   // [15->20] avancer plus fort
+input bool   UseSteppedTrailing     = true;
+input int    StepTrigger1           = 40;   // [50->40]
+input int    StepMove1              = 20;   // [10->20]
+input int    StepTrigger2           = 80;   // [100->80]
+input int    StepMove2              = 50;   // [30->50]
+input int    StepTrigger3           = 150;  // [200->150]
+input int    StepMove3              = 100;  // [50->100] verrouiller profit fort
+input bool   UseTimeBasedProtection = true;
+input int    SecondsToForceBE       = 60;   // [300->60] trades >60s perdent -5400$: BE rapide
+input int    MaxModificationRetry   = 3;
+input int    ModificationDelayMS    = 100;
+
+//--- INPUTS : VOLATILITÉ TEMPS RÉEL
+input bool   AllowHighVolatilityTrading = true;
+input double HighVolatilityRiskFactor   = 0.5;
+input int    VolatilityScanInterval     = 1;
+
+//--- INPUTS : LOGIQUE DE TRADING OPTIMISÉE XAUUSD
+input int    Tppoints             = 400;   // [1500->400] Report: TP moy gagnants 358pts - cibler proche
+input int    BarsLookback         = 25;
+input int    BarsN                = 3;
+input int    ExpirationBars       = 30;
+input ENUM_TIMEFRAMES InpTimeframe = PERIOD_M1;
+
+//--- INPUTS : FILTRES HORAIRES EXNESS
+enum StartHour { SH_Inactive=0, SH_0100=1, SH_0200=2, SH_0300=3, SH_0400=4, SH_0500=5, 
+                 SH_0600=6, SH_0700=7, SH_0800=8, SH_0900=9, SH_1000=10, SH_1100=11, 
+                 SH_1200=12, SH_1300=13, SH_1400=14, SH_1500=15, SH_1600=16, 
+                 SH_1700=17, SH_1800=18, SH_1900=19, SH_2000=20, SH_2100=21, 
+                 SH_2200=22, SH_2300=23 };
+input StartHour SHInput = SH_Inactive; // [trading 24/7 quand marché ouvert]
+
+enum EndHour { EH_Inactive=0, EH_0100=1, EH_0200=2, EH_0300=3, EH_0400=4, EH_0500=5, 
+               EH_0600=6, EH_0700=7, EH_0800=8, EH_0900=9, EH_1000=10, EH_1100=11, 
+               EH_1200=12, EH_1300=13, EH_1400=14, EH_1500=15, EH_1600=16, 
+               EH_1700=17, EH_1800=18, EH_1900=19, EH_2000=20, EH_2100=21, 
+               EH_2200=22, EH_2300=23 };
+input EndHour EHInput = EH_Inactive;   // [trading 24/7 quand marché ouvert]
+
+//--- INPUTS : PROTECTIONS JOURNALIÈRES [quotas trades désactivés sur demande]
+input bool   EnableDailyLossLimit = true;
+input double MaxDailyLossPercent  = 3.0;   // [2->3] Report DD 99% - stop quotidien plus strict mais pas étouffant
+input int    MaxConsecutiveLosses = 8;       // [999999->8] Report: séries de pertes = DD 99%
+input int    MaxTradesPerDay      = 500;     // [150->500] demande utilisateur
+input int    TradeCooldownMinutes = 1;       // [0->1] espacer les entrées pour éviter sur-expo
+
+//--- INPUTS : FILTRES TECHNIQUES OPTIMISÉS XAUUSD
+input bool   UseDynamicStops     = true;
+input int    ATR_Period          = 14;
+input double ATR_Multiplier_SL   = 0.35;    // [0.4->0.35] Report avg_loss -5.35$ - resserrer
+input double ATR_Multiplier_TP   = 1.0;     // [1.5->1.0] TP atteignable, éviter trailing qui grignote
+input double MinRiskRewardRatio  = 2.0;     // [1.5->2.0] CRITIQUE: R:R réel 0.45 - forcer min 2:1
+
+input bool   UseRSIFilter        = true;
+input int    RSI_Period          = 9;       // [7->9] moins sensible, moins de faux signaux
+input double RSI_Overbought      = 72.0;    // [75->72] filtrer plus tôt
+input double RSI_Oversold        = 28.0;    // [25->28] filtrer plus tôt
+
+input bool   UseADXFilter        = false;
+input int    ADX_Period          = 14;
+input double ADX_MinValue        = 25.0;
+
+//--- INPUTS : TRAILING STOP OPTIMISÉ XAUUSD
+input bool   UseTrailingStop     = true;
+input bool   UseBreakEven        = true;
+input int    BreakEvenTrigger    = 40;      // [30->40] laisser respirer (avg_win 2.39$ = sorties trop tôt)
+input int    BreakEvenBuffer     = 8;       // [5->8] buffer plus large
+input int    TrailStart          = 80;      // [50->80] ne pas grignoter les gains
+input int    TrailStep           = 40;      // [25->40] moins de sorties prématurées
+
+//--- INPUTS : FILTRES EXNESS OPTIMISÉS
+input bool   UseSpreadFilter     = true;
+input int    MaxSpreadPoints     = 300;
+input bool   UseMarginFilter     = true;
+input double MaxMarginUsage      = 60.0;
+input bool   UseGapFilter        = true;
+input double MaxGapPoints        = 150;
+
+//--- INPUTS : VOLATILITÉ ET VISUALISATION
+input bool   UseVolatilityDashboard  = true;
+input bool   ShowDailyStatsChart     = true;
+input ENUM_TIMEFRAMES StatsTimeframe = PERIOD_H1;
+input int    VolatilityPeriod        = 20;
+input double VolatilityThreshold     = 0.015;
+input bool   UseVolatilityFilter     = true;
+input double MinVolatilityPercent    = 0.3;
+input double MaxVolatilityPercent    = 5.0;
+
+//--- INPUTS : CONFIGURATION XAUUSD
+input int    InpMagic = 298347;
+input string TradeComment = "Scalping XAUUSD v9.7 Exness";
+input bool   EnableTrading       = true;    
+input bool   EnableLogging       = true;
+input bool   ForceXAUUSDonly     = true;
+
+//--- INPUTS : MICRO-TIMEFRAMES SYNTHÉTIQUES
+input group "=== MICRO-TIMEFRAMES SYNTHÉTIQUES ==="
+input bool   UseMicroTimeframes    = true;
+input bool   UseMicro5s            = true;
+input bool   UseMicro10s           = true;
+input bool   UseMicro15s           = true;
+input bool   UseMicro20s           = true;
+input bool   UseMicro30s           = true;
+input int    MicroBarsLookback     = 100;
+input int    MicroSRProximityPts   = 100;
+input int    MicroCooldownSec      = 3;
+
+//--- INPUTS : MULTI-ORDRES (NOUVEAU)
+input group "=== MULTI-ORDRES SIMULTANÉS ==="
+input int    MaxPositionsPerDirection = 1;     // [2->1] Report: empilement = DD massif, 1 position/dir
+input int    MaxTotalPositions        = 2;     // [3->2] limite expo totale
+input bool   UsePyramidingLots        = false; // [true->false] désactivé: multi-entrées = pertes cumulées
+input double LotMultiplier            = 0.5;   // dégressif (si jamais réactivé)
+input int    EntrySpacingPoints       = 120;   // [80->120] plus d'espacement
+input bool   UseIndependentSL         = true;    // SL indépendant par position
+input bool   UseTrailingGrid          = true;    // Grid trailing: décaler SL global
+input int    GridBreakevenAfterN      = 2;       // BE global après N positions profitables
+input bool   AllowHedging             = false;   // Autoriser Buy + Sell simultanés
+
+//--- INPUTS : MOTEUR PRÉDICTIF "SNIPER AI"
+input group "=== SNIPER AI (prédiction temps réel) ==="
+input bool   UseSniperAI           = true;   // Activer le filtre prédictif
+input int    SniperMinScore        = 70;    // [0-100] score minimum pour entrer (plus haut = sniper)
+input int    SniperTickWindow      = 40;    // Nb ticks analysés (momentum/accel)
+input double SniperW_Momentum      = 25.0;   // Poids momentum
+input double SniperW_Acceleration  = 20.0;   // Poids accélération (cassure)
+input double SniperW_RSI           = 15.0;   // Poids RSI / divergence
+input double SniperW_Volatility    = 10.0;   // Poids régime volatilité
+input double SniperW_Confluence    = 15.0;   // Poids S/R + pattern
+input double SniperW_Volume        = 15.0;   // Poids volume tick
+input bool   SniperRequireAlignment = true;  // Exiger alignement direction
+input bool   SniperLogScores       = true;   // Logguer les scores calculés
+
+//--- GLOBALES
+datetime LastTradingDay = 0;
+double   DailyStartBalance = 0;
+int      ConsecutiveLosses = 0;
+int      TradesToday = 0;
+datetime LastTradeTime = 0;
+
+//--- VARIABLES POUR SOLDE COURANT
+double   CurrentBalance = 0;
+double   TodayRealizedPL = 0;
+datetime LastBalanceUpdate = 0;
+
+//--- VARIABLES POUR SUIVI DES POSITIONS (SCAN RAPIDE)
+struct PositionSLData {
+   ulong   ticket;
+   double  openPrice;
+   datetime openTime;
+   double  lastSL;
+   int     currentStep;
+   bool    breakevenReached;
+   bool    rapidModeActive;
+   int     gridIndex;        // Index dans la grille (0= première entrée)
+   double  originalSL;       // SL d'origine pour tracking
+   string  entrySource;      // "MICRO_5s", "MICRO_10s", "M1", etc.
+};
+PositionSLData PositionsSLData[];
+int PositionsDataCount = 0;
+
+//--- HANDLES D'INDICATEURS
+int ATR_Handle = INVALID_HANDLE;
+int RSI_Handle = INVALID_HANDLE;
+int ADX_Handle = INVALID_HANDLE;
+int NormATR_Handle = INVALID_HANDLE;
+
+//--- STRUCTURES POUR SUIVI
+struct TradeStats {
+   int totalTrades;
+   int winningTrades;
+   int losingTrades;
+   double totalProfit;
+   double maxProfit;
+   double maxLoss;
+   double winRate;
+   double profitFactor;
+};
+TradeStats stats;
+
+//--- VARIABLES POUR VOLATILITÉ
+double   DailyProfitLoss[];
+double   DailyVolatility[];
+datetime LastStatUpdate = 0;
+int      StatsWindow = 1;
+double   CurrentVolatility = 0;
+double   AverageVolatility = 0;
+int      VolatilityTradesToday = 0;
+
+//--- VARIABLES POUR SCAN TEMPS RÉEL
+datetime LastVolatilityScan = 0;
+double   VolatilityRiskMultiplier = 1.0;
+bool     HighVolatilityMode = false;
+
+//--- MESURES DE VOLATILITÉ AVANCÉES
+double   RecentCandleVolatility = 0;
+double   NormalizedATR = 0;
+double   TrueRangeVolatility = 0;
+
+//--- VARIABLES POUR SL DYNAMIQUE
+double Current_SL_Distance = 0;
+double Current_SL_Level = 0;
+datetime Last_SL_Calculation = 0;
+int      OpenPositionsCount = 0;
+
+//--- CONSTANTES
+const double XAUUSD_MIN_LOT = 0.01;
+const double XAUUSD_TICK_VALUE = 0.01;
+const double XAUUSD_MARGIN_REQUIREMENT = 1000;
+
+//--- STRUCTURES POUR BARRES SYNTHÉTIQUES MICRO
+#define MAX_MICRO_BARS 2000
+struct SBar {
+   datetime time;
+   double   open, high, low, close;
+   long     tick_volume;
+};
+struct MicroBars {
+   SBar bars[MAX_MICRO_BARS];
+   int count;
+};
+MicroBars mb5, mb10, mb15, mb20, mb30;
+datetime LastMicroTradeTime = 0;
+
+//--- STRUCTURES MULTI-ORDRES (NOUVEAU)
+struct GridEntry {
+   double price;
+   double lots;
+   double sl;
+   double tp;
+   bool   executed;
+   datetime execTime;
+};
+GridEntry BuyGrid[];
+GridEntry SellGrid[];
+int BuyGridCount = 0;
+int SellGridCount = 0;
+datetime LastGridReset = 0;
+
+//--- SUIVI PAR SOURCE MICRO (NOUVEAU)
+struct MicroTradeCount {
+   int count5s;
+   int count10s;
+   int count15s;
+   int count20s;
+   int count30s;
+   datetime lastTrade5s;
+   datetime lastTrade10s;
+   datetime lastTrade15s;
+   datetime lastTrade20s;
+   datetime lastTrade30s;
+};
+MicroTradeCount microCounts;
+
+//--- SNIPER AI: buffer circulaire des derniers ticks
+#define SNIPER_BUF_SIZE 200
+struct SniperTick {
+   datetime time;
+   double   bid;
+   double   ask;
+   long     volume;
+};
+SniperTick SniperBuf[SNIPER_BUF_SIZE];
+int SniperBufHead = 0;
+int SniperBufCount = 0;
+
+struct SniperSignal {
+   double score;         // 0..100
+   int    direction;     // +1 buy, -1 sell, 0 neutre
+   double momentum;
+   double acceleration;
+   double rsiScore;
+   double volScore;
+   double confluenceScore;
+   double volumeScore;
+   string reason;
+};
+SniperSignal LastSniperSignal;
+datetime LastSniperEval = 0;
+
+//+------------------------------------------------------------------+
+//| PROTOTYPES                                                       |
+//+------------------------------------------------------------------+
+bool ValidateTradeDirection(ENUM_ORDER_TYPE orderType);
+bool CalculateDynamicStops(ENUM_ORDER_TYPE orderType, double entry, double &sl, double &tp);
+void CheckDailyReset();
+double FindSignificantHigh();
+double FindSignificantLow();
+bool ValidateDistance(double level, ENUM_ORDER_TYPE orderType);
+bool IsNewBar();
+void SendBuyOrder(double entry);
+void SendSellOrder(double entry);
+double CalculateLots(double slDist);
+void CloseAllOrdersAndPositions();
+void ManageTrailingStop();
+bool CheckTimeFilter();
+bool CheckMargin(double lots);
+bool CheckSpread();
+bool CheckPriceGap();
+bool CheckTradeCooldown();
+void UpdateConsecutiveLosses();
+void DisplayInfo();
+bool ValidateTradeConditions(ENUM_ORDER_TYPE orderType);
+double GetCurrentSpread();
+void DisplayVolatilityDashboard();
+void UpdateDailyStats();
+double CalculateIntradayVolatility();
+double CalculateHistoricalVolatility(int period = 20);
+bool AnalyzeVolatilityOpportunities();
+void AdjustParametersByVolatility();
+void CreateAdvancedDashboard();
+void UpdateDashboard();
+bool CheckXAUUSDOnly();
+bool ValidateVolatilityConditions();
+bool DetectCandlePatterns();
+bool AnalyzeVolume();
+void AnalyzeMarketCorrelations();
+double CalculateCorrelation(string symbol1, string symbol2, ENUM_TIMEFRAMES tf, int period);
+void DetectKeyLevels(double &support[], double &resistance[]);
+void UpdateTradeStats(double profit);
+void DrawSupportResistanceLevels(double &support[], double &resistance[]);
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam);
+void ScanPositionsForSLManagement();
+void CountOpenPositions();
+void InitializePositionTracking(ulong ticket, double openPrice, int gridIdx, string source);
+void UpdatePositionTracking(ulong ticket, double newSL, int step, bool be, bool rapid);
+int  FindPositionDataIndex(ulong ticket);
+bool ModifyPositionSL(ulong ticket, double newSL, double currentTP, int retryCount = 0);
+void UpdateVolatilityScan();
+void AdjustRiskForVolatility();
+double CalculateNormalizedATR(int period = 14, ENUM_TIMEFRAMES tf = PERIOD_CURRENT);
+double CalculateRecentCandleVolatility(int candles = 5);
+double CalculateTrueRangeVolatility(int period = 14);
+string GetMarketVolatilityStatus();
+void UpdateVolatilityDashboard();
+void DisplayRealTimeVolatility();
+double GetVolatilityAlertLevel();
+void CalculateTodayRealizedPL();
+void UpdateCurrentBalance();
+double GetBalanceForRiskCalculation();
+
+// PROTOTYPES POUR SL DYNAMIQUE
+double CalculateDynamicSL(ENUM_ORDER_TYPE orderType, double entryPrice);
+double CalculateSL_ATR_Adaptive(double atrValue);
+double CalculateSL_BySwings(ENUM_ORDER_TYPE orderType, double entryPrice);
+double CalculateSL_BySupportResistance(ENUM_ORDER_TYPE orderType, double entryPrice);
+double AdjustSLByVolatility(double baseDistance, double atrValue);
+double GetCurrentATR(int period);
+
+// PROTOTYPES POUR MICRO-TIMEFRAMES
+void UpdateSyntheticBar(SBar &bars[], int &count, int interval_seconds);
+void UpdateAllMicroBars();
+void DetectMicroSR(SBar &bars[], int count, double &s[], double &r[], int lookback);
+int DetectPatternOnBars(SBar &bars[], int count);
+void AnalyseMicroOpportunites();
+void ProcessMicroTimeframe(MicroBars &mb, int intervalSeconds, bool useTF, string tfLabel);
+
+// PROTOTYPES MULTI-ORDRES (NOUVEAU)
+void InitializeGridArrays();
+void ResetGridIfNeeded();
+int  CountOpenPositionsByType(ENUM_POSITION_TYPE posType);
+int  CountPendingOrdersByType(ENUM_ORDER_TYPE ordType);
+bool CanOpenMorePositions(ENUM_ORDER_TYPE orderType);
+double CalculateGridLot(int gridIndex, double baseLots);
+void SendMultiBuyOrders(double basePrice, double slDist, string source);
+void SendMultiSellOrders(double basePrice, double slDist, string source);
+void ManageGridTrailing();
+double GetAverageOpenPrice(ENUM_POSITION_TYPE posType);
+void CloseAllPositionsByType(ENUM_POSITION_TYPE posType);
+bool CheckMicroCooldown(string tfLabel);
+
+//+------------------------------------------------------------------+
+//| INITIALISATION                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(ForceXAUUSDonly && StringFind(_Symbol, "XAUUSD") < 0)
+   {
+      Alert("ERREUR: Cet EA est conçu uniquement pour le XAUUSD. Symbole actuel: ", _Symbol);
+      return(INIT_FAILED);
+   }
+   
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(15);
+   
+   long fillingMode = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fillingMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) 
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((fillingMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) 
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else 
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   
+   if(BarsN % 2 == 0)
+   {
+      Print("ERREUR: BarsN doit être impair. Valeur: ", BarsN);
+      return(INIT_FAILED);
+   }
+   
+   // Initialisation du suivi des positions
+   ArrayResize(PositionsSLData, 100);
+   PositionsDataCount = 0;
+   
+   // Initialisation des grilles multi-ordres (NOUVEAU)
+   InitializeGridArrays();
+   ResetGridIfNeeded();
+   
+   // Initialisation volatilité avancée
+   CurrentVolatility = CalculateIntradayVolatility();
+   AverageVolatility = CurrentVolatility;
+   RecentCandleVolatility = CalculateRecentCandleVolatility(10);
+   NormalizedATR = CalculateNormalizedATR(14, PERIOD_M5);
+   TrueRangeVolatility = CalculateTrueRangeVolatility(14);
+   
+   // Initialisation du solde courant
+   CheckDailyReset();
+   CalculateTodayRealizedPL();
+   UpdateCurrentBalance();
+   
+   // Initialisation des barres micro
+   mb5.count = 0; mb10.count = 0; mb15.count = 0; mb20.count = 0; mb30.count = 0;
+   LastMicroTradeTime = 0;
+   
+   // Initialisation compteurs micro (NOUVEAU)
+   microCounts.count5s = 0; microCounts.count10s = 0; microCounts.count15s = 0;
+   microCounts.count20s = 0; microCounts.count30s = 0;
+   microCounts.lastTrade5s = 0; microCounts.lastTrade10s = 0; microCounts.lastTrade15s = 0;
+   microCounts.lastTrade20s = 0; microCounts.lastTrade30s = 0;
+   
+   Print("💰 Balance de départ: $", DailyStartBalance);
+   Print("💰 Solde courant initial: $", CurrentBalance);
+   Print("💰 P&L réalisé du jour: $", TodayRealizedPL);
+   Print("🚀 Scan continu SL rapide: ACTIF");
+   Print("📊 Scan volatilité temps réel: ACTIF (intervalle ", VolatilityScanInterval, "s)");
+   Print("📈 Volatilité initiale: ", DoubleToString(CurrentVolatility, 2), "%");
+   Print("📊 ATR Normalisé: ", DoubleToString(NormalizedATR, 2), "%");
+   Print("⚖️ Calcul risque basé sur: ", UseCurrentBalanceForRisk ? "Solde courant" : "Solde compte");
+   Print("🎯 SL DYNAMIQUE: Méthode ", EnumToString(SL_Method));
+   Print("   Min Distance: ", SL_Min_Distance, " pts | Max Distance: ", SL_Max_Distance, " pts");
+   Print("⚡ MICRO-TIMEFRAMES: 5s=", UseMicro5s, " 10s=", UseMicro10s, " 15s=", UseMicro15s, " 20s=", UseMicro20s, " 30s=", UseMicro30s);
+   Print("🔥 MULTI-ORDRES: Max ", MaxPositionsPerDirection, " par direction | Total max ", MaxTotalPositions);
+   Print("   Pyramiding: ", UsePyramidingLots ? "OUI (x" + DoubleToString(LotMultiplier, 2) + ")" : "NON");
+   Print("   Espacement: ", EntrySpacingPoints, " pts | Hedging: ", AllowHedging ? "AUTORISÉ" : "INTERDIT");
+   
+   if(UseDynamicStops)
+   {
+      ATR_Handle = iATR(_Symbol, InpTimeframe, ATR_Period);
+      if(ATR_Handle == INVALID_HANDLE) 
+      {
+         Print("Erreur init ATR");
+         return(INIT_FAILED);
+      }
+   }
+   
+   if(UseRSIFilter)
+   {
+      RSI_Handle = iRSI(_Symbol, InpTimeframe, RSI_Period, PRICE_TYPICAL);
+      if(RSI_Handle == INVALID_HANDLE) 
+      {
+         Print("Erreur init RSI");
+         return(INIT_FAILED);
+      }
+   }
+   
+   if(UseADXFilter)
+   {
+      ADX_Handle = iADX(_Symbol, InpTimeframe, ADX_Period);
+      if(ADX_Handle == INVALID_HANDLE) 
+      {
+         Print("Erreur init ADX");
+         return(INIT_FAILED);
+      }
+   }
+   
+   stats.totalTrades = 0;
+   stats.winningTrades = 0;
+   stats.losingTrades = 0;
+   stats.totalProfit = 0;
+   stats.maxProfit = 0;
+   stats.maxLoss = 0;
+   stats.winRate = 0;
+   stats.profitFactor = 0;
+   
+   ArrayResize(DailyProfitLoss, 30);
+   ArrayResize(DailyVolatility, 30);
+   ArrayInitialize(DailyProfitLoss, 0);
+   ArrayInitialize(DailyVolatility, 0);
+   
+   if(UseVolatilityDashboard)
+   {
+      CreateAdvancedDashboard();
+      CreateVolatilityDashboard();
+   }
+   
+   Print("=== Scalping EA v9.7 - Multi-Ordres Micro + SL Dynamique ===");
+   Print("Solde courant: ACTIF (Départ + P&L réalisé du jour)");
+   Print("Scan continu: ACTIF");
+   Print("SL Rapide: Déclenchement à ", RapidSLTrigger, "pts, Pas à ", RapidSLStep, "pts");
+   Print("Haute Volatilité: ", AllowHighVolatilityTrading ? "PERMISE (ajustement auto)" : "BLOQUÉE");
+   Print("=============================================================");
+   
+   ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
+   ChartSetInteger(0, CHART_EVENT_OBJECT_CREATE, true);
+   ChartSetInteger(0, CHART_EVENT_OBJECT_DELETE, true);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| DEINITIALISATION                                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(ATR_Handle != INVALID_HANDLE) IndicatorRelease(ATR_Handle);
+   if(RSI_Handle != INVALID_HANDLE) IndicatorRelease(RSI_Handle);
+   if(ADX_Handle != INVALID_HANDLE) IndicatorRelease(ADX_Handle);
+   if(NormATR_Handle != INVALID_HANDLE) IndicatorRelease(NormATR_Handle);
+   
+   ObjectsDeleteAll(0, "XAUUSD_");
+   ObjectsDeleteAll(0, "ScalpV9_");
+   ObjectsDeleteAll(0, "Volatility_");
+   ObjectsDeleteAll(0, "Balance_");
+   ObjectsDeleteAll(0, "Micro_");
+   ObjectsDeleteAll(0, "Grid_"); // Nettoyage objets grille (NOUVEAU)
+   
+   Print("=== EA Arrêté ===");
+   Print("Balance de départ: $", DailyStartBalance);
+   Print("Solde courant final: $", CurrentBalance);
+   Print("P&L réalisé du jour: $", TodayRealizedPL);
+   Print("Positions suivies: ", PositionsDataCount);
+   Print("Dernière volatilité: ", DoubleToString(CurrentVolatility, 2), "%");
+   Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| ON TICK - SCAN CONTINU ULTRA-RAPIDE + MULTI-ORDRES               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Vérification XAUUSD uniquement
+   if(!CheckXAUUSDOnly())
+      return;
+
+   // Sniper AI: collecte continue du flux de ticks
+   if(UseSniperAI) SniperCollectTick();
+
+   // === MICRO-TIMEFRAMES : Mise à jour des barres synthétiques ===
+   if(UseMicroTimeframes)
+   {
+      UpdateAllMicroBars();
+      AnalyseMicroOpportunites();
+   }
+   
+   // Mise à jour du solde courant (toutes les 10 secondes pour optimiser)
+   if(TimeCurrent() - LastBalanceUpdate >= 10)
+   {
+      CalculateTodayRealizedPL();
+      UpdateCurrentBalance();
+      LastBalanceUpdate = TimeCurrent();
+   }
+   
+   // Mise à jour du dashboard
+   if(UseVolatilityDashboard)
+   {
+      UpdateDashboard();
+      UpdateVolatilityDashboard();
+   }
+   
+   // Comptage des positions pour tracking
+   CountOpenPositions();
+   
+   // SCAN CONTINU - Gestion proactive ultra-rapide des SL
+   if(OpenPositionsCount > 0 && (UseTrailingStop || UseRapidSLMovement || UseBreakEven))
+      ScanPositionsForSLManagement();
+   
+   // Gestion du grid trailing (NOUVEAU)
+   if(UseTrailingGrid && OpenPositionsCount > 1)
+      ManageGridTrailing();
+   
+   // SCAN VOLATILITÉ TEMPS RÉEL À CHAQUE TICK (optimisé)
+   UpdateVolatilityScan();
+   
+   // Traitement sur nouvelle bougie uniquement (logique M1 standard)
+   if(!IsNewBar())
+      return;
+   
+   // Réinitialisation journalière
+   CheckDailyReset();
+   
+   // Mise à jour des pertes consécutives
+   UpdateConsecutiveLosses();
+   
+   // VÉRIFICATIONS DE SÉCURITÉ
+   if(EnableDailyLossLimit)
+   {
+      double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double dailyLoss = DailyStartBalance - currentEquity;
+      
+      if(dailyLoss >= (DailyStartBalance * MaxDailyLossPercent / 100.0))
+      {
+         Print("⛔ LIMITE DE PERTE JOURNALIÈRE ATTEINTE");
+         Print("   Perte: $", dailyLoss, " (", DoubleToString((dailyLoss/DailyStartBalance)*100, 2), "%)");
+         Print("   Limite: ", MaxDailyLossPercent, "%");
+         CloseAllOrdersAndPositions();
+         return;
+      }
+   }
+   
+   if(ConsecutiveLosses >= MaxConsecutiveLosses)
+   {
+      if(EnableLogging) Print("Max pertes consécutives atteint: ", ConsecutiveLosses);
+      return;
+   }
+   
+   if(TradesToday >= MaxTradesPerDay)
+   {
+      if(EnableLogging) Print("Limite de trades journalière atteinte: ", TradesToday);
+      return;
+   }
+   
+   if(!CheckTimeFilter())
+      return;
+   
+   if(!CheckTradeCooldown())
+      return;
+   
+   if(UseSpreadFilter && !CheckSpread())
+      return;
+   
+   if(UseGapFilter && !CheckPriceGap())
+      return;
+   
+   // Validation volatilité avec option haute volatilité
+   if(UseVolatilityFilter && !ValidateVolatilityConditions())
+      return;
+   
+   // Analyse des opportunités de volatilité
+   if(AnalyzeVolatilityOpportunities())
+      AdjustParametersByVolatility();
+   
+   AnalyzeMarketCorrelations();
+   
+   double support[], resistance[];
+   DetectKeyLevels(support, resistance);
+   DrawSupportResistanceLevels(support, resistance);
+   
+   // === LOGIQUE M1 AVEC MULTI-ORDRES (NOUVEAU) ===
+   // Vérifier si on peut encore ouvrir des positions
+   if(CanOpenMorePositions(ORDER_TYPE_BUY_STOP))
+   {
+      if(ValidateTradeConditions(ORDER_TYPE_BUY_STOP))
+      {
+         double high = FindSignificantHigh();
+         if(high > 0 && ValidateDistance(high, ORDER_TYPE_BUY_STOP))
+         {
+            // Envoi multi-ordres Buy
+            double slDist = CalculateDynamicSL(ORDER_TYPE_BUY_STOP, high);
+            SendMultiBuyOrders(high, slDist, "M1");
+         }
+      }
+   }
+   
+   if(CanOpenMorePositions(ORDER_TYPE_SELL_STOP))
+   {
+      if(ValidateTradeConditions(ORDER_TYPE_SELL_STOP))
+      {
+         double low = FindSignificantLow();
+         if(low > 0 && ValidateDistance(low, ORDER_TYPE_SELL_STOP))
+         {
+            // Envoi multi-ordres Sell
+            double slDist = CalculateDynamicSL(ORDER_TYPE_SELL_STOP, low);
+            SendMultiSellOrders(low, slDist, "M1");
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| INITIALISATION DES TABLEAUX DE GRILLE (NOUVEAU)                  |
+//+------------------------------------------------------------------+
+void InitializeGridArrays()
+{
+   ArrayResize(BuyGrid, MaxPositionsPerDirection);
+   ArrayResize(SellGrid, MaxPositionsPerDirection);
+   for(int i = 0; i < MaxPositionsPerDirection; i++)
+   {
+      BuyGrid[i].executed = false;
+      BuyGrid[i].execTime = 0;
+      SellGrid[i].executed = false;
+      SellGrid[i].execTime = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| RÉINITIALISATION DE LA GRILLE SI NÉCESSAIRE (NOUVEAU)             |
+//+------------------------------------------------------------------+
+void ResetGridIfNeeded()
+{
+   // Réinitialiser la grille si aucune position ouverte depuis longtemps
+   bool hasBuyPositions = (CountOpenPositionsByType(POSITION_TYPE_BUY) > 0);
+   bool hasSellPositions = (CountOpenPositionsByType(POSITION_TYPE_SELL) > 0);
+   
+   if(!hasBuyPositions)
+   {
+      for(int i = 0; i < MaxPositionsPerDirection; i++)
+         BuyGrid[i].executed = false;
+   }
+   
+   if(!hasSellPositions)
+   {
+      for(int i = 0; i < MaxPositionsPerDirection; i++)
+         SellGrid[i].executed = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| COMPTAGE DES POSITIONS OUVERTES PAR TYPE (NOUVEAU)                |
+//+------------------------------------------------------------------+
+int CountOpenPositionsByType(ENUM_POSITION_TYPE posType)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_TYPE) == posType)
+      {
+         count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| COMPTAGE DES ORDRES EN ATTENTE PAR TYPE (NOUVEAU)                 |
+//+------------------------------------------------------------------+
+int CountPendingOrdersByType(ENUM_ORDER_TYPE ordType)
+{
+   int count = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == InpMagic && 
+            OrderGetString(ORDER_SYMBOL) == _Symbol &&
+            OrderGetInteger(ORDER_TYPE) == ordType)
+         {
+            count++;
+         }
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| VÉRIFICATION SI ON PEUT OUVRIR PLUS DE POSITIONS (NOUVEAU)        |
+//+------------------------------------------------------------------+
+bool CanOpenMorePositions(ENUM_ORDER_TYPE orderType)
+{
+   int buyPositions = CountOpenPositionsByType(POSITION_TYPE_BUY);
+   int sellPositions = CountOpenPositionsByType(POSITION_TYPE_SELL);
+   int totalPositions = buyPositions + sellPositions;
+   
+   // Vérifier limite totale
+   if(totalPositions >= MaxTotalPositions)
+   {
+      if(EnableLogging && MathRand()%100 < 5) 
+         Print("⛔ Limite totale atteinte: ", totalPositions, "/", MaxTotalPositions);
+      return false;
+   }
+   
+   // Vérifier limite par direction
+   if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY)
+   {
+      if(buyPositions >= MaxPositionsPerDirection)
+      {
+         if(EnableLogging && MathRand()%100 < 5) 
+            Print("⛔ Limite BUY atteinte: ", buyPositions, "/", MaxPositionsPerDirection);
+         return false;
+      }
+   }
+   
+   if(orderType == ORDER_TYPE_SELL_STOP || orderType == ORDER_TYPE_SELL)
+   {
+      if(sellPositions >= MaxPositionsPerDirection)
+      {
+         if(EnableLogging && MathRand()%100 < 5) 
+            Print("⛔ Limite SELL atteinte: ", sellPositions, "/", MaxPositionsPerDirection);
+         return false;
+      }
+   }
+   
+   // Vérifier hedging
+   if(!AllowHedging)
+   {
+      if((orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY) && sellPositions > 0)
+         return false;
+      if((orderType == ORDER_TYPE_SELL_STOP || orderType == ORDER_TYPE_SELL) && buyPositions > 0)
+         return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL DU LOT POUR CHAQUE NIVEAU DE GRILLE (NOUVEAU)             |
+//+------------------------------------------------------------------+
+double CalculateGridLot(int gridIndex, double baseLots)
+{
+   if(!UsePyramidingLots || gridIndex == 0)
+      return baseLots;
+   
+   // Multiplicateur : < 1 = dégressif (réduit le risque), > 1 = progressif (martingale)
+   double multiplier = MathPow(LotMultiplier, gridIndex);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   
+   double lots = baseLots * multiplier;
+   lots = MathFloor(lots / lotStep) * lotStep;
+   
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   
+   return lots;
+}
+
+//+------------------------------------------------------------------+
+//| ENVOI MULTI-ORDRES BUY (NOUVEAU)                                 |
+//+------------------------------------------------------------------+
+void SendMultiBuyOrders(double basePrice, double slDist, string source)
+{
+   if(!EnableTrading)
+   {
+      Print("📊 Mode Simulation: Multi BUY @ ", basePrice);
+      return;
+   }
+
+   // Filtre prédictif Sniper AI
+   if(!SniperAllowEntry(ORDER_TYPE_BUY_STOP))
+      return;
+
+   // Ajustement haute volatilité sur TP
+   double tpMultiplier = MinRiskRewardRatio;
+   if(HighVolatilityMode)
+   {
+      double volatilitySpread = (CurrentVolatility - AverageVolatility) * basePrice / 100;
+      tpMultiplier = MinRiskRewardRatio + (volatilitySpread * 0.3 / slDist);
+   }
+
+   bool isMicroSource = (StringFind(source, "MICRO") >= 0);
+   int openedCount = 0;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = 0; i < MaxPositionsPerDirection; i++)
+   {
+      if(!CanOpenMorePositions(ORDER_TYPE_BUY_STOP)) break;
+      if(TradesToday >= MaxTradesPerDay) break;
+
+      double entryPrice = basePrice + (i * EntrySpacingPoints * _Point);
+
+      double sl = entryPrice - slDist;
+      double tp = entryPrice + (slDist * tpMultiplier);
+
+      double baseLots = CalculateLots(slDist);
+      double lots = CalculateGridLot(i, baseLots);
+
+      if(UseMarginFilter && !CheckMargin(lots))
+      {
+         Print("⚠️ Marge insuffisante pour niveau ", i);
+         continue;
+      }
+
+      string comment = TradeComment + " " + source + "_BUY_" + IntegerToString(i+1);
+
+      if(EnableLogging)
+         PrintFormat("📦 GRID BUY %s[%d]: Entry=%.2f SL=%.2f TP=%.2f Lots=%.2f",
+                     source, i+1, entryPrice, sl, tp, lots);
+
+      bool success = false;
+
+      if(isMicroSource)
+      {
+         sl = currentPrice - slDist;
+         tp = currentPrice + (slDist * tpMultiplier);
+         success = trade.Buy(lots, _Symbol, currentPrice, sl, tp, comment);
+      }
+      else
+      {
+         if(entryPrice <= currentPrice + MinDistPoints * _Point)
+         {
+            if(EnableLogging) Print("⏭️ Niveau ", i, " trop proche du prix, skip");
+            continue;
+         }
+         datetime expiration = iTime(_Symbol, InpTimeframe, 0) + ExpirationBars * PeriodSeconds(InpTimeframe);
+         success = trade.BuyStop(lots, entryPrice, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiration, comment);
+      }
+
+      if(success)
+      {
+         // Comptage TradesToday déplacé dans OnTradeTransaction (DEAL_ENTRY_IN uniquement)
+         LastTradeTime = TimeCurrent();
+         openedCount++;
+
+         if(i < ArraySize(BuyGrid))
+         {
+            BuyGrid[i].price = isMicroSource ? currentPrice : entryPrice;
+            BuyGrid[i].lots = lots;
+            BuyGrid[i].sl = sl;
+            BuyGrid[i].tp = tp;
+            BuyGrid[i].executed = true;
+            BuyGrid[i].execTime = TimeCurrent();
+         }
+
+         Print("✅ Grid BUY ", source, " niveau ", i+1, " @", (isMicroSource ? currentPrice : entryPrice), " Lots=", lots);
+      }
+      else
+      {
+         Print("❌ Erreur Grid BUY niveau ", i+1, ": ", GetLastError());
+      }
+   }
+
+   if(openedCount > 0)
+      Print("🎯 ", openedCount, " ordres BUY ", source, " envoyés en grille");
+}
+
+//+------------------------------------------------------------------+
+//| ENVOI MULTI-ORDRES SELL (NOUVEAU)                                |
+//+------------------------------------------------------------------+
+void SendMultiSellOrders(double basePrice, double slDist, string source)
+{
+   if(!EnableTrading)
+   {
+      Print("📊 Mode Simulation: Multi SELL @ ", basePrice);
+      return;
+   }
+
+   // Filtre prédictif Sniper AI
+   if(!SniperAllowEntry(ORDER_TYPE_SELL_STOP))
+      return;
+
+   double tpMultiplier = MinRiskRewardRatio;
+   if(HighVolatilityMode)
+   {
+      double volatilitySpread = (CurrentVolatility - AverageVolatility) * basePrice / 100;
+      tpMultiplier = MinRiskRewardRatio + (volatilitySpread * 0.3 / slDist);
+   }
+
+   bool isMicroSource = (StringFind(source, "MICRO") >= 0);
+   int openedCount = 0;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   for(int i = 0; i < MaxPositionsPerDirection; i++)
+   {
+      if(!CanOpenMorePositions(ORDER_TYPE_SELL_STOP)) break;
+      if(TradesToday >= MaxTradesPerDay) break;
+
+      double entryPrice = basePrice - (i * EntrySpacingPoints * _Point);
+
+      double sl = entryPrice + slDist;
+      double tp = entryPrice - (slDist * tpMultiplier);
+
+      double baseLots = CalculateLots(slDist);
+      double lots = CalculateGridLot(i, baseLots);
+
+      if(UseMarginFilter && !CheckMargin(lots))
+      {
+         Print("⚠️ Marge insuffisante pour niveau SELL ", i);
+         continue;
+      }
+
+      string comment = TradeComment + " " + source + "_SELL_" + IntegerToString(i+1);
+
+      if(EnableLogging)
+         PrintFormat("📦 GRID SELL %s[%d]: Entry=%.2f SL=%.2f TP=%.2f Lots=%.2f",
+                     source, i+1, entryPrice, sl, tp, lots);
+      
+      bool success = false;
+
+      if(isMicroSource)
+      {
+         sl = currentPrice + slDist;
+         tp = currentPrice - (slDist * tpMultiplier);
+         success = trade.Sell(lots, _Symbol, currentPrice, sl, tp, comment);
+      }
+      else
+      {
+         if(entryPrice >= currentPrice - MinDistPoints * _Point)
+         {
+            if(EnableLogging) Print("⏭️ Niveau SELL ", i, " trop proche du prix, skip");
+            continue;
+         }
+         datetime expiration = iTime(_Symbol, InpTimeframe, 0) + ExpirationBars * PeriodSeconds(InpTimeframe);
+         success = trade.SellStop(lots, entryPrice, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiration, comment);
+      }
+
+      if(success)
+      {
+         // Comptage TradesToday déplacé dans OnTradeTransaction (DEAL_ENTRY_IN uniquement)
+         LastTradeTime = TimeCurrent();
+         openedCount++;
+
+         if(i < ArraySize(SellGrid))
+         {
+            SellGrid[i].price = isMicroSource ? currentPrice : entryPrice;
+            SellGrid[i].lots = lots;
+            SellGrid[i].sl = sl;
+            SellGrid[i].tp = tp;
+            SellGrid[i].executed = true;
+            SellGrid[i].execTime = TimeCurrent();
+         }
+
+         Print("✅ Grid SELL ", source, " niveau ", i+1, " @", (isMicroSource ? currentPrice : entryPrice), " Lots=", lots);
+      }
+      else
+      {
+         Print("❌ Erreur Grid SELL niveau ", i+1, ": ", GetLastError());
+      }
+   }
+
+   if(openedCount > 0)
+      Print("🎯 ", openedCount, " ordres SELL ", source, " envoyés en grille");
+}
+
+//+------------------------------------------------------------------+
+//| GESTION DU TRAILING GRID (NOUVEAU)                               |
+//+------------------------------------------------------------------+
+void ManageGridTrailing()
+{
+   // Si plusieurs positions dans la même direction sont profitables,
+   // déplacer le SL de toutes vers le prix d'entrée moyen ou le BE
+   
+   // Gestion BUY
+   int buyCount = CountOpenPositionsByType(POSITION_TYPE_BUY);
+   if(buyCount >= GridBreakevenAfterN && UseBreakEven)
+   {
+      double avgPrice = GetAverageOpenPrice(POSITION_TYPE_BUY);
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      if(avgPrice > 0 && currentBid > avgPrice + BreakEvenTrigger * _Point)
+      {
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            
+            if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+               PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            {
+               double currentSL = PositionGetDouble(POSITION_SL);
+               double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double newSL = openPrice + BreakEvenBuffer * _Point;
+               
+               if(newSL > currentSL + _Point)
+               {
+                  double currentTP = PositionGetDouble(POSITION_TP);
+                  ModifyPositionSL(ticket, newSL, currentTP, 0);
+               }
+            }
+         }
+      }
+   }
+   
+   // Gestion SELL
+   int sellCount = CountOpenPositionsByType(POSITION_TYPE_SELL);
+   if(sellCount >= GridBreakevenAfterN && UseBreakEven)
+   {
+      double avgPrice = GetAverageOpenPrice(POSITION_TYPE_SELL);
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      if(avgPrice > 0 && currentAsk < avgPrice - BreakEvenTrigger * _Point)
+      {
+         for(int i = PositionsTotal() - 1; i >= 0; i--)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            
+            if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+               PositionGetString(POSITION_SYMBOL) == _Symbol &&
+               PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            {
+               double currentSL = PositionGetDouble(POSITION_SL);
+               double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+               double newSL = openPrice - BreakEvenBuffer * _Point;
+               
+               if(newSL < currentSL - _Point || currentSL == 0)
+               {
+                  double currentTP = PositionGetDouble(POSITION_TP);
+                  ModifyPositionSL(ticket, newSL, currentTP, 0);
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| PRIX D'OUVERTURE MOYEN (NOUVEAU)                                  |
+//+------------------------------------------------------------------+
+double GetAverageOpenPrice(ENUM_POSITION_TYPE posType)
+{
+   double sumPrice = 0;
+   double sumLots = 0;
+   int count = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_TYPE) == posType)
+      {
+         double lots = PositionGetDouble(POSITION_VOLUME);
+         double price = PositionGetDouble(POSITION_PRICE_OPEN);
+         sumPrice += price * lots;
+         sumLots += lots;
+         count++;
+      }
+   }
+   
+   if(count == 0 || sumLots == 0) return 0;
+   return sumPrice / sumLots;
+}
+
+//+------------------------------------------------------------------+
+//| FERMETURE DE TOUTES LES POSITIONS PAR TYPE (NOUVEAU)              |
+//+------------------------------------------------------------------+
+void CloseAllPositionsByType(ENUM_POSITION_TYPE posType)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_TYPE) == posType)
+      {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| VÉRIFICATION COOLDOWN MICRO PAR TIMEFRAME (NOUVEAU)               |
+//+------------------------------------------------------------------+
+bool CheckMicroCooldown(string tfLabel)
+{
+   datetime now = TimeCurrent();
+   int cooldown = MicroCooldownSec;
+   
+   if(tfLabel == "5s") 
+   {
+      if(now - microCounts.lastTrade5s < cooldown) return false;
+      microCounts.lastTrade5s = now;
+   }
+   else if(tfLabel == "10s") 
+   {
+      if(now - microCounts.lastTrade10s < cooldown) return false;
+      microCounts.lastTrade10s = now;
+   }
+   else if(tfLabel == "15s") 
+   {
+      if(now - microCounts.lastTrade15s < cooldown) return false;
+      microCounts.lastTrade15s = now;
+   }
+   else if(tfLabel == "20s") 
+   {
+      if(now - microCounts.lastTrade20s < cooldown) return false;
+      microCounts.lastTrade20s = now;
+   }
+   else if(tfLabel == "30s") 
+   {
+      if(now - microCounts.lastTrade30s < cooldown) return false;
+      microCounts.lastTrade30s = now;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MICRO-TIMEFRAMES : MISE À JOUR DES BARRES SYNTHÉTIQUES           |
+//+------------------------------------------------------------------+
+void UpdateSyntheticBar(SBar &bars[], int &count, int interval_seconds)
+{
+   datetime now = TimeCurrent();
+   datetime bar_time = now - (now % interval_seconds);
+
+   if(count == 0 || bars[count-1].time != bar_time)
+   {
+      if(count >= MAX_MICRO_BARS)
+      {
+         for(int i = 0; i < MAX_MICRO_BARS - 1; i++)
+            bars[i] = bars[i+1];
+         count = MAX_MICRO_BARS - 1;
+      }
+      bars[count].time = bar_time;
+      bars[count].open = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      bars[count].high = bars[count].open;
+      bars[count].low  = bars[count].open;
+      bars[count].close = bars[count].open;
+      bars[count].tick_volume = 1;
+      count++;
+   }
+   else
+   {
+      int idx = count - 1;
+      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(price > bars[idx].high) bars[idx].high = price;
+      if(price < bars[idx].low)  bars[idx].low  = price;
+      bars[idx].close = price;
+      bars[idx].tick_volume++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MISE À JOUR DE TOUTES LES BARRES MICRO                           |
+//+------------------------------------------------------------------+
+void UpdateAllMicroBars()
+{
+   if(UseMicro5s)  UpdateSyntheticBar(mb5.bars, mb5.count, 5);
+   if(UseMicro10s) UpdateSyntheticBar(mb10.bars, mb10.count, 10);
+   if(UseMicro15s) UpdateSyntheticBar(mb15.bars, mb15.count, 15);
+   if(UseMicro20s) UpdateSyntheticBar(mb20.bars, mb20.count, 20);
+   if(UseMicro30s) UpdateSyntheticBar(mb30.bars, mb30.count, 30);
+}
+
+//+------------------------------------------------------------------+
+//| DÉTECTION SUPPORTS/RÉSISTANCES MICRO                             |
+//+------------------------------------------------------------------+
+void DetectMicroSR(SBar &bars[], int count, double &s[], double &r[], int lookback = 50)
+{
+   ArrayResize(s, 0);
+   ArrayResize(r, 0);
+   if(count < 5) return;
+   
+   int start = MathMax(0, count - lookback);
+   for(int i = start + 2; i < count - 2; i++)
+   {
+      // Pic local = Résistance
+      if(bars[i].high > bars[i-1].high && bars[i].high > bars[i-2].high &&
+         bars[i].high > bars[i+1].high && bars[i].high > bars[i+2].high)
+      {
+         int size = ArraySize(r);
+         ArrayResize(r, size + 1);
+         r[size] = bars[i].high;
+      }
+      
+      // Creux local = Support
+      if(bars[i].low < bars[i-1].low && bars[i].low < bars[i-2].low &&
+         bars[i].low < bars[i+1].low && bars[i].low < bars[i+2].low)
+      {
+         int size = ArraySize(s);
+         ArrayResize(s, size + 1);
+         s[size] = bars[i].low;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DÉTECTION DE PATTERNS SUR BARRES SYNTHÉTIQUES                    |
+//+------------------------------------------------------------------+
+// Retourne +1 = signal haussier, -1 = signal baissier, 0 = pas de signal
+int DetectPatternOnBars(SBar &bars[], int count)
+{
+   if(count < 3) return 0;
+
+   int idx = count - 2;
+   if(idx < 1) return 0;
+
+   double open  = bars[idx].open;
+   double close = bars[idx].close;
+   double high  = bars[idx].high;
+   double low   = bars[idx].low;
+
+   double prevOpen  = bars[idx-1].open;
+   double prevClose = bars[idx-1].close;
+
+   if(high == low) return 0;
+
+   double body = MathAbs(close - open);
+   double range = high - low;
+   double upperShadow = high - MathMax(open, close);
+   double lowerShadow = MathMin(open, close) - low;
+
+   // Hammer (haussier) — longue mèche basse, corps haut
+   if(lowerShadow > body * 2 && upperShadow < body * 0.5 && close > open)
+   {
+      if(EnableLogging) Print("🔨 Micro Hammer détecté [", TimeToString(bars[idx].time, TIME_SECONDS), "]");
+      return +1;
+   }
+
+   // Shooting Star (baissier) — longue mèche haute, corps bas
+   if(upperShadow > body * 2 && lowerShadow < body * 0.5 && close < open)
+   {
+      if(EnableLogging) Print("⭐ Micro Shooting Star détecté [", TimeToString(bars[idx].time, TIME_SECONDS), "]");
+      return -1;
+   }
+
+   // Engulfing haussier
+   if(close > open && prevClose < prevOpen && open <= prevClose && close >= prevOpen)
+   {
+      if(EnableLogging) Print("🟢 Micro Engulfing haussier détecté");
+      return +1;
+   }
+
+   // Engulfing baissier
+   if(close < open && prevClose > prevOpen && open >= prevClose && close <= prevOpen)
+   {
+      if(EnableLogging) Print("🔴 Micro Engulfing baissier détecté");
+      return -1;
+   }
+
+   // Doji — direction basée sur la tendance récente
+   if(body / range < 0.1 && range > 2 * _Point)
+   {
+      double prev2Close = (idx >= 2) ? bars[idx-2].close : prevClose;
+      if(prevClose < prev2Close)
+      {
+         if(EnableLogging) Print("🕯️ Micro Doji haussier (après baisse) [", TimeToString(bars[idx].time, TIME_SECONDS), "]");
+         return +1;
+      }
+      else
+      {
+         if(EnableLogging) Print("🕯️ Micro Doji baissier (après hausse) [", TimeToString(bars[idx].time, TIME_SECONDS), "]");
+         return -1;
+      }
+   }
+
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| ANALYSE ET TRADING SUR MICRO-TIMEFRAMES (MODIFIÉ MULTI-ORDRES)   |
+//+------------------------------------------------------------------+
+void AnalyseMicroOpportunites()
+{
+   if(!UseMicroTimeframes) return;
+   if(!EnableTrading) return;
+   if(TradesToday >= MaxTradesPerDay) return;
+   if(ConsecutiveLosses >= MaxConsecutiveLosses) return;
+   if(!CheckTimeFilter()) return;
+   
+   // Filtres de sécurité
+   if(UseSpreadFilter && !CheckSpread()) return;
+   if(UseGapFilter && !CheckPriceGap()) return;
+   if(UseVolatilityFilter && !ValidateVolatilityConditions()) return;
+   
+   // Traiter chaque timeframe micro activé
+   ProcessMicroTimeframe(mb5, 5, UseMicro5s, "5s");
+   ProcessMicroTimeframe(mb10, 10, UseMicro10s, "10s");
+   ProcessMicroTimeframe(mb15, 15, UseMicro15s, "15s");
+   ProcessMicroTimeframe(mb20, 20, UseMicro20s, "20s");
+   ProcessMicroTimeframe(mb30, 30, UseMicro30s, "30s");
+}
+
+//+------------------------------------------------------------------+
+//| TRAITEMENT GÉNÉRIQUE D'UN TIMEFRAME MICRO (MODIFIÉ MULTI-ORDRES)  |
+//+------------------------------------------------------------------+
+void ProcessMicroTimeframe(MicroBars &mb, int intervalSeconds, bool useTF, string tfLabel)
+{
+   if(!useTF || mb.count < 20) return;
+
+   if(!CheckMicroCooldown(tfLabel)) return;
+
+   int signal = DetectPatternOnBars(mb.bars, mb.count);
+   if(signal == 0) return;
+
+   double s[], r[];
+   DetectMicroSR(mb.bars, mb.count, s, r, MicroBarsLookback);
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // === SIGNAL HAUSSIER : pattern +1 + près d'un support ===
+   if(signal > 0 && CanOpenMorePositions(ORDER_TYPE_BUY))
+   {
+      bool nearSupport = false;
+      for(int i = 0; i < ArraySize(s); i++)
+      {
+         if(MathAbs(bid - s[i]) < MicroSRProximityPts * _Point)
+         {
+            nearSupport = true;
+            break;
+         }
+      }
+
+      if(nearSupport)
+      {
+         double slDist = CalculateDynamicSL(ORDER_TYPE_BUY, ask);
+         SendMultiBuyOrders(ask, slDist, "MICRO_" + tfLabel);
+
+         if(tfLabel == "5s") microCounts.count5s++;
+         else if(tfLabel == "10s") microCounts.count10s++;
+         else if(tfLabel == "15s") microCounts.count15s++;
+         else if(tfLabel == "20s") microCounts.count20s++;
+         else if(tfLabel == "30s") microCounts.count30s++;
+      }
+   }
+
+   // === SIGNAL BAISSIER : pattern -1 + près d'une résistance ===
+   if(signal < 0 && CanOpenMorePositions(ORDER_TYPE_SELL))
+   {
+      bool nearResistance = false;
+      for(int i = 0; i < ArraySize(r); i++)
+      {
+         if(MathAbs(ask - r[i]) < MicroSRProximityPts * _Point)
+         {
+            nearResistance = true;
+            break;
+         }
+      }
+
+      if(nearResistance)
+      {
+         double slDist = CalculateDynamicSL(ORDER_TYPE_SELL, bid);
+         SendMultiSellOrders(bid, slDist, "MICRO_" + tfLabel);
+
+         if(tfLabel == "5s") microCounts.count5s++;
+         else if(tfLabel == "10s") microCounts.count10s++;
+         else if(tfLabel == "15s") microCounts.count15s++;
+         else if(tfLabel == "20s") microCounts.count20s++;
+         else if(tfLabel == "30s") microCounts.count30s++;
+      }
+      }
+   }
+
+
+//+------------------------------------------------------------------+
+//| CALCUL DU SL DYNAMIQUE PAR OPPORTUNITÉ                           |
+//+------------------------------------------------------------------+
+double CalculateDynamicSL(ENUM_ORDER_TYPE orderType, double entryPrice)
+{
+   double slDistance = 0;
+   double atrValue = GetCurrentATR(14);
+   
+   if(SL_Method == SL_ATR_ADAPTIVE || SL_Method == SL_HYBRID)
+   {
+      slDistance = CalculateSL_ATR_Adaptive(atrValue);
+   }
+   
+   if(SL_Method == SL_SWING_POINTS || SL_Method == SL_HYBRID)
+   {
+      double swingSL = CalculateSL_BySwings(orderType, entryPrice);
+      if(swingSL > 0)
+      {
+         if(SL_Method == SL_HYBRID)
+            slDistance = MathMax(slDistance, swingSL);
+         else
+            slDistance = swingSL;
+      }
+   }
+   
+   if(SL_Method == SL_SUPPORT_RESISTANCE)
+   {
+      double srSL = CalculateSL_BySupportResistance(orderType, entryPrice);
+      if(srSL > 0) slDistance = srSL;
+   }
+   
+   if(SL_Use_Volatility_Adjustment)
+   {
+      slDistance = AdjustSLByVolatility(slDistance, atrValue);
+   }
+   
+   slDistance = MathMax(slDistance, SL_Min_Distance * _Point);
+   slDistance = MathMin(slDistance, SL_Max_Distance * _Point);
+   
+   Current_SL_Distance = slDistance;
+   Last_SL_Calculation = TimeCurrent();
+   
+   return slDistance;
+}
+
+//+------------------------------------------------------------------+
+//| SL par ATR Adaptatif                                             |
+//+------------------------------------------------------------------+
+double CalculateSL_ATR_Adaptive(double atrValue)
+{
+   if(atrValue <= 0) return SL_Min_Distance * _Point;
+   
+   double volRatio = 1.0;
+   if(AverageVolatility > 0)
+      volRatio = CurrentVolatility / AverageVolatility;
+   
+   double multiplier = SL_ATR_MinMultiplier;
+   
+   if(volRatio > 1.5)
+      multiplier = SL_ATR_MaxMultiplier;
+   else if(volRatio > 1.0)
+      multiplier = (SL_ATR_MinMultiplier + SL_ATR_MaxMultiplier) / 1.5;
+   else if(volRatio < 0.7)
+      multiplier = SL_ATR_MinMultiplier * 0.8;
+   
+   double distance = atrValue * multiplier;
+   
+   if(EnableLogging)
+      Print("📊 SL ATR Adaptatif: ATR=", DoubleToString(atrValue/_Point,1), 
+            " pts | Multiplicateur=", DoubleToString(multiplier,2),
+            " | Distance=", DoubleToString(distance/_Point,1), " pts");
+   
+   return distance;
+}
+
+//+------------------------------------------------------------------+
+//| SL basé sur les Swings récents                                   |
+//+------------------------------------------------------------------+
+double CalculateSL_BySwings(ENUM_ORDER_TYPE orderType, double entryPrice)
+{
+   double lowestLow = DBL_MAX;
+   double highestHigh = 0;
+   
+   for(int i = 1; i <= SL_Swing_Lookback; i++)
+   {
+      double low = iLow(_Symbol, InpTimeframe, i);
+      double high = iHigh(_Symbol, InpTimeframe, i);
+      
+      if(low < lowestLow) lowestLow = low;
+      if(high > highestHigh) highestHigh = high;
+   }
+   
+   double distance = 0;
+   
+   if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY)
+   {
+      double buffer = (entryPrice - lowestLow) * 0.1;
+      distance = (entryPrice - lowestLow) + buffer;
+   }
+   else
+   {
+      double buffer = (highestHigh - entryPrice) * 0.1;
+      distance = (highestHigh - entryPrice) + buffer;
+   }
+   
+   if(EnableLogging)
+      Print("🏔️ SL par Swings: Low=", DoubleToString(lowestLow,2), 
+            " | High=", DoubleToString(highestHigh,2),
+            " | Distance=", DoubleToString(distance/_Point,1), " pts");
+   
+   return distance;
+}
+
+//+------------------------------------------------------------------+
+//| SL basé sur les niveaux Support/Résistance                       |
+//+------------------------------------------------------------------+
+double CalculateSL_BySupportResistance(ENUM_ORDER_TYPE orderType, double entryPrice)
+{
+   double support[], resistance[];
+   DetectKeyLevels(support, resistance);
+   
+   double nearestLevel = 0;
+   double minDistance = DBL_MAX;
+   
+   if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY)
+   {
+      for(int i = 0; i < ArraySize(support); i++)
+      {
+         if(support[i] < entryPrice)
+         {
+            double dist = entryPrice - support[i];
+            if(dist < minDistance && dist > SL_Min_Distance * _Point)
+            {
+               minDistance = dist;
+               nearestLevel = support[i];
+            }
+         }
+      }
+   }
+   else
+   {
+      for(int i = 0; i < ArraySize(resistance); i++)
+      {
+         if(resistance[i] > entryPrice)
+         {
+            double dist = resistance[i] - entryPrice;
+            if(dist < minDistance && dist > SL_Min_Distance * _Point)
+            {
+               minDistance = dist;
+               nearestLevel = resistance[i];
+            }
+         }
+      }
+   }
+   
+   if(nearestLevel > 0)
+   {
+      double buffer = minDistance * 0.05;
+      if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY)
+         return (entryPrice - nearestLevel) + buffer;
+      else
+         return (nearestLevel - entryPrice) + buffer;
+   }
+   
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Ajustement du SL selon la volatilité temps réel                  |
+//+------------------------------------------------------------------+
+double AdjustSLByVolatility(double baseDistance, double atrValue)
+{
+   double adjustment = 1.0;
+   
+   if(HighVolatilityMode)
+      adjustment = 1.3;
+   else if(CurrentVolatility > AverageVolatility * 1.2)
+      adjustment = 1.15;
+   else if(CurrentVolatility < AverageVolatility * 0.6)
+      adjustment = 0.9;
+   
+   double adjustedDistance = baseDistance * adjustment;
+   
+   if(EnableLogging && adjustment != 1.0)
+      Print("🌊 Ajustement volatilité: ", DoubleToString(adjustment*100,0), 
+            "% | Distance ajustée: ", DoubleToString(adjustedDistance/_Point,1), " pts");
+   
+   return adjustedDistance;
+}
+
+//+------------------------------------------------------------------+
+//| Récupération de l'ATR actuel                                     |
+//+------------------------------------------------------------------+
+double GetCurrentATR(int period)
+{
+   if(ATR_Handle == INVALID_HANDLE)
+   {
+      ATR_Handle = iATR(_Symbol, InpTimeframe, period);
+      if(ATR_Handle == INVALID_HANDLE) return 0;
+   }
+   
+   double atrBuffer[];
+   ArraySetAsSeries(atrBuffer, true);
+   
+   if(CopyBuffer(ATR_Handle, 0, 0, 1, atrBuffer) <= 0)
+      return 0;
+   
+   return atrBuffer[0];
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL DU P&L RÉALISÉ DU JOUR                                    |
+//+------------------------------------------------------------------+
+void CalculateTodayRealizedPL()
+{
+   TodayRealizedPL = 0;
+   
+   MqlDateTime dtStart, dtNow;
+   TimeToStruct(TimeCurrent(), dtNow);
+   dtStart.year = dtNow.year;
+   dtStart.mon = dtNow.mon;
+   dtStart.day = dtNow.day;
+   dtStart.hour = 0;
+   dtStart.min = 0;
+   dtStart.sec = 0;
+   
+   datetime startOfDay = StructToTime(dtStart);
+   datetime endOfDay = startOfDay + 86400;
+   
+   if(HistorySelect(startOfDay, endOfDay))
+   {
+      int totalDeals = HistoryDealsTotal();
+      
+      for(int i = 0; i < totalDeals; i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket == 0) continue;
+         
+         if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic) continue;
+         if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+         
+         ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_OUT)
+         {
+            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT) + 
+                           HistoryDealGetDouble(ticket, DEAL_SWAP) + 
+                           HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+            
+            TodayRealizedPL += profit;
+         }
+      }
+   }
+   
+   static datetime lastPLlog = 0;
+   if(TimeCurrent() - lastPLlog > 300)
+   {
+      if(EnableLogging && MathAbs(TodayRealizedPL) > 0.01)
+      {
+         Print("📊 P&L réalisé du jour: $", DoubleToString(TodayRealizedPL, 2));
+      }
+      lastPLlog = TimeCurrent();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MISE À JOUR DU SOLDE COURANT                                     |
+//+------------------------------------------------------------------+
+void UpdateCurrentBalance()
+{
+   CurrentBalance = DailyStartBalance + TodayRealizedPL;
+   
+   if(CurrentBalance < 0)
+   {
+      Print("⚠️ ATTENTION: Solde courant négatif: $", CurrentBalance);
+      CurrentBalance = MathMax(CurrentBalance, 10);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OBTENIR LE SOLDE POUR LES CALCULS DE RISQUE                      |
+//+------------------------------------------------------------------+
+double GetBalanceForRiskCalculation()
+{
+   if(UseCurrentBalanceForRisk)
+      return CurrentBalance;
+   else
+      return AccountInfoDouble(ACCOUNT_BALANCE);
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL DES LOTS SANS LIMITE FIXE 1%                              |
+//+------------------------------------------------------------------+
+double CalculateLots(double slDist)
+{
+   if(slDist <= 0)
+   {
+      Print("Erreur: distance SL <= 0");
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   }
+   
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   
+   double balance = GetBalanceForRiskCalculation();
+   
+   double riskMoney = balance * RiskPercent / 100.0;
+   
+   if(CurrentVolatility > AverageVolatility * 2.0)
+      riskMoney *= 0.7;
+   else if(CurrentVolatility > AverageVolatility * 1.5)
+      riskMoney *= 0.85;
+   
+   double moneyRiskPerLot = (slDist / tickSize) * tickValue;
+   if(moneyRiskPerLot <= 0) 
+   {
+      Print("Erreur: moneyRiskPerLot <= 0");
+      return minLot;
+   }
+   
+   double lots = riskMoney / moneyRiskPerLot;
+   lots = MathFloor(lots / lotStep) * lotStep;
+   
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   
+   if(UseMarginFilter && !CheckMargin(lots))
+   {
+      while(lots > minLot && !CheckMargin(lots))
+      {
+         lots -= lotStep;
+         if(lots < minLot) lots = minLot;
+      }
+   }
+   
+   if(EnableLogging)
+   {
+      double finalRiskMoney = lots * moneyRiskPerLot;
+      double finalRiskPercent = (finalRiskMoney / balance) * 100.0;
+      
+      Print("💰 Calcul lot:");
+      Print("   Solde utilisé: $", DoubleToString(balance, 2));
+      Print("   Distance SL: ", DoubleToString(slDist, 2), " points");
+      Print("   Risque par lot: $", DoubleToString(moneyRiskPerLot, 2));
+      Print("   Lot calculé: ", DoubleToString(lots, 2));
+      Print("   Risque final: $", DoubleToString(finalRiskMoney, 2), 
+            " (", DoubleToString(finalRiskPercent, 2), "%)");
+   }
+   
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| CHECK DAILY RESET                                                |
+//+------------------------------------------------------------------+
+void CheckDailyReset()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   datetime today = StringToTime(StringFormat("%d.%02d.%02d", dt.year, dt.mon, dt.day));
+   
+   if(LastTradingDay != today)
+   {
+      LastTradingDay = today;
+      DailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      ConsecutiveLosses = 0;
+      TradesToday = 0;
+      VolatilityTradesToday = 0;
+      
+      TodayRealizedPL = 0;
+      UpdateCurrentBalance();
+      
+      PositionsDataCount = 0;
+      
+      // Reset des barres micro
+      mb5.count = 0; mb10.count = 0; mb15.count = 0; mb20.count = 0; mb30.count = 0;
+      LastMicroTradeTime = 0;
+      
+      // Reset des grilles (NOUVEAU)
+      InitializeGridArrays();
+      
+      // Reset compteurs micro
+      microCounts.count5s = 0; microCounts.count10s = 0; microCounts.count15s = 0;
+      microCounts.count20s = 0; microCounts.count30s = 0;
+      microCounts.lastTrade5s = 0; microCounts.lastTrade10s = 0; microCounts.lastTrade15s = 0;
+      microCounts.lastTrade20s = 0; microCounts.lastTrade30s = 0;
+      
+      CurrentVolatility = CalculateIntradayVolatility();
+      AverageVolatility = CurrentVolatility;
+      HighVolatilityMode = false;
+      VolatilityRiskMultiplier = 1.0;
+      RecentCandleVolatility = CalculateRecentCandleVolatility(10);
+      NormalizedATR = CalculateNormalizedATR(14, PERIOD_M5);
+      TrueRangeVolatility = CalculateTrueRangeVolatility(14);
+      
+      Print("🌅 Reset Journalier");
+      Print("   Balance de départ: $", DailyStartBalance);
+      Print("   Solde courant: $", CurrentBalance);
+      Print("   Suivi des positions réinitialisé");
+      Print("   Barres micro réinitialisées");
+      Print("   Grilles multi-ordres réinitialisées");
+      Print("📈 Volatilité réinitialisée: ", DoubleToString(CurrentVolatility, 2), "%");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL DE VOLATILITÉ ATR NORMALISÉ EN TEMPS RÉEL                 |
+//+------------------------------------------------------------------+
+double CalculateNormalizedATR(int period = 14, ENUM_TIMEFRAMES tf = PERIOD_CURRENT)
+{
+    double atrArray[];
+    ArraySetAsSeries(atrArray, true);
+
+    if(NormATR_Handle == INVALID_HANDLE)
+    {
+        NormATR_Handle = iATR(_Symbol, tf, period);
+        if(NormATR_Handle == INVALID_HANDLE) return 0;
+    }
+
+    if(CopyBuffer(NormATR_Handle, 0, 0, period, atrArray) <= 0)
+        return 0;
+
+    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if(currentPrice == 0) return 0;
+
+    double avgATR = 0;
+    int count = 0;
+    int limit = MathMin(period, ArraySize(atrArray));
+    for(int i = 0; i < limit; i++)
+    {
+        if(atrArray[i] > 0)
+        {
+            avgATR += atrArray[i];
+            count++;
+        }
+    }
+
+    if(count == 0) return 0;
+
+    avgATR /= count;
+    return (avgATR / currentPrice) * 100;
+}
+
+//+------------------------------------------------------------------+
+//| VOLATILITÉ DES DERNIÈRES BOUGIES                                 |
+//+------------------------------------------------------------------+
+double CalculateRecentCandleVolatility(int candles = 5)
+{
+    double volatilitySum = 0;
+    int count = 0;
+    
+    for(int i = 0; i < candles; i++)
+    {
+        double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+        double low = iLow(_Symbol, PERIOD_CURRENT, i);
+        double open = iOpen(_Symbol, PERIOD_CURRENT, i);
+        
+        if(high > 0 && low > 0 && open > 0)
+        {
+            double range = (high - low) / open * 100;
+            volatilitySum += range;
+            count++;
+        }
+    }
+    
+    if(count == 0) return 0;
+    return volatilitySum / count;
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL TRUE RANGE VOLATILITY                                     |
+//+------------------------------------------------------------------+
+double CalculateTrueRangeVolatility(int period = 14)
+{
+    double trSum = 0;
+    int count = 0;
+    
+    for(int i = 0; i < period; i++)
+    {
+        double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+        double low = iLow(_Symbol, PERIOD_CURRENT, i);
+        double prevClose = iClose(_Symbol, PERIOD_CURRENT, i+1);
+        
+        if(high > 0 && low > 0 && prevClose > 0)
+        {
+            double tr1 = high - low;
+            double tr2 = MathAbs(high - prevClose);
+            double tr3 = MathAbs(low - prevClose);
+            
+            double trueRange = MathMax(tr1, MathMax(tr2, tr3));
+            trSum += trueRange;
+            count++;
+        }
+    }
+    
+    if(count == 0) return 0;
+    
+    double avgTrueRange = trSum / count;
+    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    if(currentPrice == 0) return 0;
+    
+    return (avgTrueRange / currentPrice) * 100;
+}
+
+//+------------------------------------------------------------------+
+//| FONCTION PRINCIPALE: OBTENIR VOLATILITÉ TEMPS RÉEL               |
+//+------------------------------------------------------------------+
+string GetMarketVolatilityStatus()
+{
+    double intradayVol = CalculateIntradayVolatility();
+    double recentVol = CalculateRecentCandleVolatility(10);
+    double normalizedATR = CalculateNormalizedATR(14, PERIOD_M5);
+    double trueRangeVol = CalculateTrueRangeVolatility(14);
+    
+    string volatilityStatus = "";
+    color volColor = clrGray;
+    
+    double maxVol = MathMax(MathMax(intradayVol, recentVol), MathMax(normalizedATR, trueRangeVol));
+    
+    if(maxVol > 0.8 || normalizedATR > 0.6)
+    {
+        volatilityStatus = "HAUTE VOLATILITÉ";
+        volColor = clrRed;
+    }
+    else if(maxVol > 0.4 || normalizedATR > 0.3)
+    {
+        volatilityStatus = "VOLATILITÉ MODÉRÉE";
+        volColor = clrOrange;
+    }
+    else if(maxVol > 0.1)
+    {
+        volatilityStatus = "VOLATILITÉ FAIBLE";
+        volColor = clrGreen;
+    }
+    else
+    {
+        volatilityStatus = "TRÈS FAIBLE VOLATILITÉ";
+        volColor = clrBlue;
+    }
+    
+    string report = 
+        "📊 ÉTAT DE VOLATILITÉ: " + volatilityStatus + "\n" +
+        "├─ Volatilité Intraday: " + DoubleToString(intradayVol, 2) + "%\n" +
+        "├─ Volatilité Récente (10 bougies): " + DoubleToString(recentVol, 2) + "%\n" +
+        "├─ ATR Normalisé: " + DoubleToString(normalizedATR, 2) + "%\n" +
+        "├─ True Range: " + DoubleToString(trueRangeVol, 2) + "%\n" +
+        "└─ Mode Haute Vol: " + (HighVolatilityMode ? "ACTIF" : "INACTIF");
+    
+    if(UseVolatilityDashboard)
+    {
+        ObjectCreate(0, "Volatility_Status", OBJ_LABEL, 0, 0, 0);
+        ObjectSetString(0, "Volatility_Status", OBJPROP_TEXT, volatilityStatus);
+        ObjectSetInteger(0, "Volatility_Status", OBJPROP_XDISTANCE, 10);
+        ObjectSetInteger(0, "Volatility_Status", OBJPROP_YDISTANCE, 30);
+        ObjectSetInteger(0, "Volatility_Status", OBJPROP_COLOR, volColor);
+        ObjectSetInteger(0, "Volatility_Status", OBJPROP_FONTSIZE, 10);
+    }
+    
+    return report;
+}
+
+//+------------------------------------------------------------------+
+//| DASHBOARD DÉTAILLÉ DE VOLATILITÉ                                 |
+//+------------------------------------------------------------------+
+void CreateVolatilityDashboard()
+{
+    if(!UseVolatilityDashboard) return;
+    
+    int x = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS) - 220;
+    int y = 10;
+    
+    ObjectCreate(0, "Volatility_Dashboard_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_XDISTANCE, x - 5);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_YDISTANCE, y - 5);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_XSIZE, 210);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_YSIZE, 150);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_BGCOLOR, clrBlack);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_BORDER_COLOR, clrGray);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    
+    ObjectCreate(0, "Volatility_Dashboard_Title", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Dashboard_Title", OBJPROP_TEXT, "📊 VOLATILITÉ TEMPS RÉEL");
+    ObjectSetInteger(0, "Volatility_Dashboard_Title", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_Dashboard_Title", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Dashboard_Title", OBJPROP_COLOR, clrGold);
+    ObjectSetInteger(0, "Volatility_Dashboard_Title", OBJPROP_FONTSIZE, 9);
+    
+    y += 20;
+    
+    ObjectCreate(0, "Volatility_Intraday_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Intraday_Label", OBJPROP_TEXT, "Intraday:");
+    ObjectSetInteger(0, "Volatility_Intraday_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_Intraday_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Intraday_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_Intraday_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_Intraday_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Intraday_Value", OBJPROP_TEXT, "0.00%");
+    ObjectSetInteger(0, "Volatility_Intraday_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_Intraday_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Intraday_Value", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(0, "Volatility_Intraday_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_Recent_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Recent_Label", OBJPROP_TEXT, "Récente:");
+    ObjectSetInteger(0, "Volatility_Recent_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_Recent_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Recent_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_Recent_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_Recent_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Recent_Value", OBJPROP_TEXT, "0.00%");
+    ObjectSetInteger(0, "Volatility_Recent_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_Recent_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Recent_Value", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(0, "Volatility_Recent_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_ATR_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_ATR_Label", OBJPROP_TEXT, "ATR Norm:");
+    ObjectSetInteger(0, "Volatility_ATR_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_ATR_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_ATR_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_ATR_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_ATR_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_ATR_Value", OBJPROP_TEXT, "0.00%");
+    ObjectSetInteger(0, "Volatility_ATR_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_ATR_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_ATR_Value", OBJPROP_COLOR, clrDodgerBlue);
+    ObjectSetInteger(0, "Volatility_ATR_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_TR_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_TR_Label", OBJPROP_TEXT, "True Range:");
+    ObjectSetInteger(0, "Volatility_TR_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_TR_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_TR_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_TR_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_TR_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_TR_Value", OBJPROP_TEXT, "0.00%");
+    ObjectSetInteger(0, "Volatility_TR_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_TR_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_TR_Value", OBJPROP_COLOR, clrDodgerBlue);
+    ObjectSetInteger(0, "Volatility_TR_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_Ratio_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Ratio_Label", OBJPROP_TEXT, "Ratio Vol:");
+    ObjectSetInteger(0, "Volatility_Ratio_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_Ratio_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Ratio_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_Ratio_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_Ratio_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Ratio_Value", OBJPROP_TEXT, "1.00");
+    ObjectSetInteger(0, "Volatility_Ratio_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_Ratio_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Ratio_Value", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_Ratio_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_Status_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Status_Label", OBJPROP_TEXT, "Statut:");
+    ObjectSetInteger(0, "Volatility_Status_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_Status_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Status_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_Status_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_Status_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_Status_Value", OBJPROP_TEXT, "NORMAL");
+    ObjectSetInteger(0, "Volatility_Status_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_Status_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_Status_Value", OBJPROP_COLOR, clrGreen);
+    ObjectSetInteger(0, "Volatility_Status_Value", OBJPROP_FONTSIZE, 8);
+    
+    y += 15;
+    
+    ObjectCreate(0, "Volatility_HighMode_Label", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_HighMode_Label", OBJPROP_TEXT, "Mode HV:");
+    ObjectSetInteger(0, "Volatility_HighMode_Label", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "Volatility_HighMode_Label", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_HighMode_Label", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "Volatility_HighMode_Label", OBJPROP_FONTSIZE, 8);
+    
+    ObjectCreate(0, "Volatility_HighMode_Value", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "Volatility_HighMode_Value", OBJPROP_TEXT, "INACTIF");
+    ObjectSetInteger(0, "Volatility_HighMode_Value", OBJPROP_XDISTANCE, x + 80);
+    ObjectSetInteger(0, "Volatility_HighMode_Value", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "Volatility_HighMode_Value", OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, "Volatility_HighMode_Value", OBJPROP_FONTSIZE, 8);
+}
+
+//+------------------------------------------------------------------+
+//| MISE À JOUR DU DASHBOARD DE VOLATILITÉ                           |
+//+------------------------------------------------------------------+
+void UpdateVolatilityDashboard()
+{
+    if(!UseVolatilityDashboard) return;
+
+    double intradayVol = CurrentVolatility;
+    double recentVol = RecentCandleVolatility;
+    double normalizedATR = NormalizedATR;
+    double trueRangeVol = TrueRangeVolatility;
+    double volRatio = (AverageVolatility > 0) ? CurrentVolatility / AverageVolatility : 1.0;
+    
+    ObjectSetString(0, "Volatility_Intraday_Value", OBJPROP_TEXT, DoubleToString(intradayVol, 2) + "%");
+    ObjectSetString(0, "Volatility_Recent_Value", OBJPROP_TEXT, DoubleToString(recentVol, 2) + "%");
+    ObjectSetString(0, "Volatility_ATR_Value", OBJPROP_TEXT, DoubleToString(normalizedATR, 2) + "%");
+    ObjectSetString(0, "Volatility_TR_Value", OBJPROP_TEXT, DoubleToString(trueRangeVol, 2) + "%");
+    ObjectSetString(0, "Volatility_Ratio_Value", OBJPROP_TEXT, DoubleToString(volRatio, 2));
+    
+    string status = "NORMAL";
+    color statusColor = clrGreen;
+    
+    if(HighVolatilityMode)
+    {
+        status = "HAUTE VOL";
+        statusColor = clrRed;
+    }
+    else if(intradayVol > AverageVolatility * 1.3)
+    {
+        status = "ÉLEVÉE";
+        statusColor = clrOrange;
+    }
+    else if(intradayVol < AverageVolatility * 0.7)
+    {
+        status = "BASSE";
+        statusColor = clrBlue;
+    }
+    
+    ObjectSetString(0, "Volatility_Status_Value", OBJPROP_TEXT, status);
+    ObjectSetInteger(0, "Volatility_Status_Value", OBJPROP_COLOR, statusColor);
+    
+    string highModeText = HighVolatilityMode ? "ACTIF" : "INACTIF";
+    color highModeColor = HighVolatilityMode ? clrOrangeRed : clrGray;
+    ObjectSetString(0, "Volatility_HighMode_Value", OBJPROP_TEXT, highModeText);
+    ObjectSetInteger(0, "Volatility_HighMode_Value", OBJPROP_COLOR, highModeColor);
+    
+    color bgColor = clrBlack;
+    if(HighVolatilityMode)
+        bgColor = C'30,0,0';
+    else if(intradayVol > AverageVolatility * 1.5)
+        bgColor = C'30,15,0';
+    
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_BGCOLOR, bgColor);
+    ObjectSetInteger(0, "Volatility_Dashboard_BG", OBJPROP_BORDER_COLOR, statusColor);
+}
+
+//+------------------------------------------------------------------+
+//| SCAN VOLATILITÉ TEMPS RÉEL AVEC MESURES MULTIPLES                |
+//+------------------------------------------------------------------+
+void UpdateVolatilityScan()
+{
+    datetime currentTime = TimeCurrent();
+    
+    if(currentTime - LastVolatilityScan < VolatilityScanInterval) 
+        return;
+    
+    LastVolatilityScan = currentTime;
+    
+    double newIntradayVol = CalculateIntradayVolatility();
+    RecentCandleVolatility = CalculateRecentCandleVolatility(10);
+    NormalizedATR = CalculateNormalizedATR(14, PERIOD_M5);
+    TrueRangeVolatility = CalculateTrueRangeVolatility(14);
+    
+    if(AverageVolatility == 0)
+        AverageVolatility = newIntradayVol;
+    else
+        AverageVolatility = (AverageVolatility * 0.6) + (newIntradayVol * 0.4);
+    
+    CurrentVolatility = newIntradayVol;
+    
+    double volRatio = (AverageVolatility > 0) ? CurrentVolatility / AverageVolatility : 1.0;
+    bool wasHighVol = HighVolatilityMode;
+    
+    bool highVolByIntraday = (volRatio > 1.5);
+    bool highVolByRecent = (RecentCandleVolatility > 0.8);
+    bool highVolByATR = (NormalizedATR > 0.6);
+    bool highVolByTrueRange = (TrueRangeVolatility > 0.7);
+    
+    HighVolatilityMode = (highVolByIntraday && highVolByRecent) || highVolByATR || highVolByTrueRange;
+    
+    if(HighVolatilityMode && !wasHighVol && EnableLogging)
+    {
+        Print("🌊 MODE HAUTE VOLATILITÉ ACTIVÉ");
+        Print("   Ratio Intraday: ", DoubleToString(volRatio, 2));
+        Print("   Vol Récente: ", DoubleToString(RecentCandleVolatility, 2), "%");
+        Print("   ATR Normalisé: ", DoubleToString(NormalizedATR, 2), "%");
+        
+        if(UseVolatilityDashboard)
+        {
+            ObjectCreate(0, "HighVolAlert", OBJ_LABEL, 0, 0, 0);
+            ObjectSetString(0, "HighVolAlert", OBJPROP_TEXT, "⚠️ HAUTE VOLATILITÉ DÉTECTÉE");
+            ObjectSetInteger(0, "HighVolAlert", OBJPROP_XDISTANCE, (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS) / 2 - 100);
+            ObjectSetInteger(0, "HighVolAlert", OBJPROP_YDISTANCE, 50);
+            ObjectSetInteger(0, "HighVolAlert", OBJPROP_COLOR, clrRed);
+            ObjectSetInteger(0, "HighVolAlert", OBJPROP_FONTSIZE, 12);
+        }
+    }
+    else if(!HighVolatilityMode && wasHighVol && EnableLogging)
+    {
+        Print("😌 Retour à volatilité normale");
+        ObjectDelete(0, "HighVolAlert");
+    }
+    
+    AdjustRiskForVolatility();
+    
+    static datetime lastLogTime = 0;
+    if(currentTime - lastLogTime > 600)
+    {
+        if(EnableLogging)
+        {
+            string volReport = GetMarketVolatilityStatus();
+            Print(volReport);
+        }
+        lastLogTime = currentTime;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| AJUSTEMENT RISQUE SELON VOLATILITÉ                               |
+//+------------------------------------------------------------------+
+void AdjustRiskForVolatility()
+{
+    double volRatio = (AverageVolatility > 0) ? CurrentVolatility / AverageVolatility : 1.0;
+    
+    if(volRatio > 2.0 || NormalizedATR > 0.8)
+        VolatilityRiskMultiplier = HighVolatilityRiskFactor;
+    else if(volRatio > 1.5 || NormalizedATR > 0.5)
+        VolatilityRiskMultiplier = 0.7;
+    else if(volRatio < 0.5)
+        VolatilityRiskMultiplier = 0.8;
+    else
+        VolatilityRiskMultiplier = 1.0;
+    
+    if(EnableLogging && VolatilityRiskMultiplier != 1.0 && MathRand()%100 < 10)
+        Print("⚖️ Ajustement risque: ", DoubleToString(VolatilityRiskMultiplier * 100, 0), 
+              "% (Vol: ", DoubleToString(CurrentVolatility, 2), "% | ATR: ", DoubleToString(NormalizedATR, 2), "%)");
+}
+
+//+------------------------------------------------------------------+
+//| SCAN CONTINU AMÉLIORÉ POUR GESTION ULTRA-RAPIDE DES SL           |
+//+------------------------------------------------------------------+
+void ScanPositionsForSLManagement()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        
+        if(PositionGetInteger(POSITION_MAGIC) != InpMagic || 
+           PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+        
+        double currentSL = PositionGetDouble(POSITION_SL);
+        double currentTP = PositionGetDouble(POSITION_TP);
+        double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+        long openTimeLong = PositionGetInteger(POSITION_TIME);
+        datetime openTime = (datetime)openTimeLong;
+        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        
+        double currentPrice = (type == POSITION_TYPE_BUY) ? 
+                            SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        
+        double profitPoints = (type == POSITION_TYPE_BUY) ? 
+                            (currentPrice - openPrice) / _Point : 
+                            (openPrice - currentPrice) / _Point;
+        
+        int dataIndex = FindPositionDataIndex(ticket);
+        if(dataIndex < 0)
+        {
+            InitializePositionTracking(ticket, openPrice, 0, "UNKNOWN");
+            dataIndex = FindPositionDataIndex(ticket);
+        }
+        
+        double newSL = currentSL;
+        bool shouldModify = false;
+        int currentStep = PositionsSLData[dataIndex].currentStep;
+        bool isBreakeven = PositionsSLData[dataIndex].breakevenReached;
+        bool isRapid = PositionsSLData[dataIndex].rapidModeActive;
+        
+        if(UseRapidSLMovement && profitPoints >= RapidSLTrigger && !isRapid)
+        {
+            if(type == POSITION_TYPE_BUY)
+            {
+                double rapidLevel = openPrice + (profitPoints - RapidSLStep) * _Point;
+                if(rapidLevel > newSL + _Point)
+                {
+                    newSL = rapidLevel;
+                    shouldModify = true;
+                    isRapid = true;
+                    if(EnableLogging) Print("⚡ MODE RAPIDE Buy Ticket#", ticket, " @", newSL, " (Profit: ", profitPoints, "pts)");
+                }
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+                double rapidLevel = openPrice - (profitPoints - RapidSLStep) * _Point;
+                if(rapidLevel < newSL - _Point)
+                {
+                    newSL = rapidLevel;
+                    shouldModify = true;
+                    isRapid = true;
+                    if(EnableLogging) Print("⚡ MODE RAPIDE Sell Ticket#", ticket, " @", newSL, " (Profit: ", profitPoints, "pts)");
+                }
+            }
+        }
+        
+        if(UseSteppedTrailing && profitPoints >= StepTrigger1)
+        {
+            int targetStep = 0;
+            if(profitPoints >= StepTrigger3) targetStep = 3;
+            else if(profitPoints >= StepTrigger2) targetStep = 2;
+            else if(profitPoints >= StepTrigger1) targetStep = 1;
+            
+            if(targetStep > currentStep)
+            {
+                double stepBuffer = 0;
+                if(targetStep == 1) stepBuffer = StepMove1 * _Point;
+                else if(targetStep == 2) stepBuffer = StepMove2 * _Point;
+                else if(targetStep == 3) stepBuffer = StepMove3 * _Point;
+                
+                if(type == POSITION_TYPE_BUY)
+                {
+                    double stepLevel = openPrice + stepBuffer;
+                    if(stepLevel > newSL + _Point)
+                    {
+                        newSL = stepLevel;
+                        shouldModify = true;
+                        currentStep = targetStep;
+                        if(EnableLogging) Print("⬆️ PALIER ", targetStep, " Buy Ticket#", ticket, " SL→", newSL);
+                    }
+                }
+                else if(type == POSITION_TYPE_SELL)
+                {
+                    double stepLevel = openPrice - stepBuffer;
+                    if(stepLevel < newSL - _Point)
+                    {
+                        newSL = stepLevel;
+                        shouldModify = true;
+                        currentStep = targetStep;
+                        if(EnableLogging) Print("⬇️ PALIER ", targetStep, " Sell Ticket#", ticket, " SL→", newSL);
+                    }
+                }
+            }
+        }
+        
+        if(UseBreakEven && profitPoints >= BreakEvenTrigger && !isBreakeven)
+        {
+            if(type == POSITION_TYPE_BUY)
+            {
+                double beLevel = openPrice + BreakEvenBuffer * _Point;
+                if(beLevel > newSL + _Point)
+                {
+                    newSL = beLevel;
+                    shouldModify = true;
+                    isBreakeven = true;
+                    if(EnableLogging) Print("🔄 BREAKEVEN Buy Ticket#", ticket, " @", beLevel);
+                }
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+                double beLevel = openPrice - BreakEvenBuffer * _Point;
+                if(beLevel < newSL - _Point)
+                {
+                    newSL = beLevel;
+                    shouldModify = true;
+                    isBreakeven = true;
+                    if(EnableLogging) Print("🔄 BREAKEVEN Sell Ticket#", ticket, " @", beLevel);
+                }
+            }
+        }
+        
+        if(UseTimeBasedProtection && !isBreakeven && profitPoints > 20)
+        {
+            int secondsOpen = (int)(TimeCurrent() - openTime);
+            if(secondsOpen >= SecondsToForceBE)
+            {
+                if(type == POSITION_TYPE_BUY)
+                {
+                    double beLevel = openPrice + BreakEvenBuffer * _Point;
+                    if(beLevel > newSL + _Point)
+                    {
+                        newSL = beLevel;
+                        shouldModify = true;
+                        isBreakeven = true;
+                        if(EnableLogging) Print("⏰ TIME-BE Buy Ticket#", ticket, " après ", secondsOpen, "s");
+                    }
+                }
+                else if(type == POSITION_TYPE_SELL)
+                {
+                    double beLevel = openPrice - BreakEvenBuffer * _Point;
+                    if(beLevel < newSL - _Point)
+                    {
+                        newSL = beLevel;
+                        shouldModify = true;
+                        isBreakeven = true;
+                        if(EnableLogging) Print("⏰ TIME-BE Sell Ticket#", ticket, " après ", secondsOpen, "s");
+                    }
+                }
+            }
+        }
+        
+        if(UseTrailingStop && profitPoints >= TrailStart)
+        {
+            if(type == POSITION_TYPE_BUY)
+            {
+                double trailLevel = currentPrice - TrailStep * _Point;
+                if(trailLevel > newSL + _Point)
+                {
+                    newSL = trailLevel;
+                    shouldModify = true;
+                }
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+                double trailLevel = currentPrice + TrailStep * _Point;
+                if(trailLevel < newSL - _Point)
+                {
+                    newSL = trailLevel;
+                    shouldModify = true;
+                }
+            }
+        }
+        
+        if(shouldModify && MathAbs(newSL - currentSL) > _Point/2)
+        {
+            if(ModifyPositionSL(ticket, newSL, currentTP, 0))
+            {
+                UpdatePositionTracking(ticket, newSL, currentStep, isBreakeven, isRapid);
+                
+                if(EnableLogging)
+                    Print("✅ SL MODIFIÉ Ticket#", ticket, " : ", currentSL, " → ", newSL, 
+                          " (Step:", currentStep, "|BE:", isBreakeven, "|Rapid:", isRapid, ")");
+            }
+        }
+    }
+    
+    for(int i = PositionsDataCount - 1; i >= 0; i--)
+    {
+        bool found = false;
+        for(int j = PositionsTotal() - 1; j >= 0; j--)
+        {
+            if(PositionGetTicket(j) == PositionsSLData[i].ticket)
+            {
+                found = true;
+                break;
+            }
+        }
+        if(!found)
+        {
+            for(int k = i; k < PositionsDataCount - 1; k++)
+                PositionsSLData[k] = PositionsSLData[k+1];
+            PositionsDataCount--;
+            if(EnableLogging) Print("🧹 Nettoyage suivi position #", i);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Fonctions utilitaires pour suivi positions                       |
+//+------------------------------------------------------------------+
+void InitializePositionTracking(ulong ticket, double openPrice, int gridIdx, string source)
+{
+    if(PositionsDataCount >= ArraySize(PositionsSLData))
+        ArrayResize(PositionsSLData, ArraySize(PositionsSLData) + 50);
+    
+    PositionsSLData[PositionsDataCount].ticket = ticket;
+    PositionsSLData[PositionsDataCount].openPrice = openPrice;
+    PositionsSLData[PositionsDataCount].openTime = TimeCurrent();
+    PositionsSLData[PositionsDataCount].lastSL = 0;
+    PositionsSLData[PositionsDataCount].currentStep = 0;
+    PositionsSLData[PositionsDataCount].breakevenReached = false;
+    PositionsSLData[PositionsDataCount].rapidModeActive = false;
+    PositionsSLData[PositionsDataCount].gridIndex = gridIdx;
+    PositionsSLData[PositionsDataCount].originalSL = 0;
+    PositionsSLData[PositionsDataCount].entrySource = source;
+    PositionsDataCount++;
+    
+    if(EnableLogging) Print("📍 Nouveau suivi position Ticket#", ticket, " @", openPrice, " [", source, "]");
+}
+
+int FindPositionDataIndex(ulong ticket)
+{
+    for(int i = 0; i < PositionsDataCount; i++)
+    {
+        if(PositionsSLData[i].ticket == ticket)
+            return i;
+    }
+    return -1;
+}
+
+void UpdatePositionTracking(ulong ticket, double newSL, int step, bool be, bool rapid)
+{
+    int idx = FindPositionDataIndex(ticket);
+    if(idx >= 0)
+    {
+        PositionsSLData[idx].lastSL = newSL;
+        PositionsSLData[idx].currentStep = step;
+        PositionsSLData[idx].breakevenReached = be;
+        PositionsSLData[idx].rapidModeActive = rapid;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Modification SL avec retry pour Exness                           |
+//+------------------------------------------------------------------+
+bool ModifyPositionSL(ulong ticket, double newSL, double currentTP, int retryCount)
+{
+    if(!trade.PositionModify(ticket, newSL, currentTP))
+    {
+        int error = GetLastError();
+        if(EnableLogging) Print("⚠️ Erreur modif SL Ticket#", ticket, " Error: ", error, " Tentative: ", retryCount+1);
+        
+        if(retryCount < MaxModificationRetry && 
+           (error == TRADE_RETCODE_PRICE_CHANGED || 
+            error == TRADE_RETCODE_REQUOTE || 
+            error == TRADE_RETCODE_TIMEOUT ||
+            error == TRADE_RETCODE_TOO_MANY_REQUESTS))
+        {
+            Sleep(ModificationDelayMS);
+            return ModifyPositionSL(ticket, newSL, currentTP, retryCount + 1);
+        }
+        return false;
+    }
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| COMPTAGE DES POSITIONS OUVERTES                                  |
+//+------------------------------------------------------------------+
+void CountOpenPositions()
+{
+    OpenPositionsCount = 0;
+    
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        
+        if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+           PositionGetString(POSITION_SYMBOL) == _Symbol)
+        {
+            OpenPositionsCount++;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| SEND BUY ORDER (SIMPLE - POUR COMPATIBILITÉ)                     |
+//+------------------------------------------------------------------+
+void SendBuyOrder(double entry)
+{
+   if(!EnableTrading)
+   {
+      Print("📊 Mode Simulation: BUY STOP @ ", entry);
+      return;
+   }
+   
+   double slDist = CalculateDynamicSL(ORDER_TYPE_BUY_STOP, entry);
+   SendMultiBuyOrders(entry, slDist, "M1_SINGLE");
+}
+
+//+------------------------------------------------------------------+
+//| SEND SELL ORDER (SIMPLE - POUR COMPATIBILITÉ)                    |
+//+------------------------------------------------------------------+
+void SendSellOrder(double entry)
+{
+   if(!EnableTrading)
+   {
+      Print("📊 Mode Simulation: SELL STOP @ ", entry);
+      return;
+   }
+   
+   double slDist = CalculateDynamicSL(ORDER_TYPE_SELL_STOP, entry);
+   SendMultiSellOrders(entry, slDist, "M1_SINGLE");
+}
+
+//+------------------------------------------------------------------+
+//| CREATE ADVANCED DASHBOARD                                        |
+//+------------------------------------------------------------------+
+void CreateAdvancedDashboard()
+{
+    if(!UseVolatilityDashboard) return;
+    
+    int x = 20;
+    int y = 50;
+    int spacing = 25;
+    
+    ObjectCreate(0, "XAUUSD_Dashboard_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_XDISTANCE, x-10);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_YDISTANCE, y-10);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_XSIZE, 420);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_YSIZE, spacing*20);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_BGCOLOR, clrBlack);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_BORDER_COLOR, clrGold);
+    
+    ObjectCreate(0, "XAUUSD_Header", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_Header", OBJPROP_TEXT, "=== DASHBOARD XAUUSD v9.7 ===");
+    ObjectSetInteger(0, "XAUUSD_Header", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Header", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Header", OBJPROP_COLOR, clrGold);
+    ObjectSetInteger(0, "XAUUSD_Header", OBJPROP_FONTSIZE, 11);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_StartBalance", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_StartBalance", OBJPROP_TEXT, "Solde Départ: $---");
+    ObjectSetInteger(0, "XAUUSD_StartBalance", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_StartBalance", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_StartBalance", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_StartBalance", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_RealizedPL", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_RealizedPL", OBJPROP_TEXT, "P&L Réalisé: $---");
+    ObjectSetInteger(0, "XAUUSD_RealizedPL", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_RealizedPL", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_RealizedPL", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_RealizedPL", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_CurrentBalance", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_CurrentBalance", OBJPROP_TEXT, "SOLDE COURANT: $---");
+    ObjectSetInteger(0, "XAUUSD_CurrentBalance", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_CurrentBalance", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_CurrentBalance", OBJPROP_COLOR, clrGold);
+    ObjectSetInteger(0, "XAUUSD_CurrentBalance", OBJPROP_FONTSIZE, 9);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_MultiOrderStatus", OBJ_LABEL, 0, 0, 0); // NOUVEAU
+    ObjectSetString(0, "XAUUSD_MultiOrderStatus", OBJPROP_TEXT, "Multi-Ordres: OFF");
+    ObjectSetInteger(0, "XAUUSD_MultiOrderStatus", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_MultiOrderStatus", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_MultiOrderStatus", OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, "XAUUSD_MultiOrderStatus", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_MicroStatus", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_MicroStatus", OBJPROP_TEXT, "Micro: OFF");
+    ObjectSetInteger(0, "XAUUSD_MicroStatus", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_MicroStatus", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_MicroStatus", OBJPROP_COLOR, clrGray);
+    ObjectSetInteger(0, "XAUUSD_MicroStatus", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_ScanStatus", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_ScanStatus", OBJPROP_TEXT, "Scan SL: ACTIF");
+    ObjectSetInteger(0, "XAUUSD_ScanStatus", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_ScanStatus", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_ScanStatus", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(0, "XAUUSD_ScanStatus", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_VolStatus", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_VolStatus", OBJPROP_TEXT, "Vol: SCANNING...");
+    ObjectSetInteger(0, "XAUUSD_VolStatus", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_VolStatus", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_VolStatus", OBJPROP_COLOR, clrDodgerBlue);
+    ObjectSetInteger(0, "XAUUSD_VolStatus", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_Balance", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_Balance", OBJPROP_TEXT, "Balance Compte: $---");
+    ObjectSetInteger(0, "XAUUSD_Balance", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Balance", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Balance", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_Balance", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_DailyPL", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_DailyPL", OBJPROP_TEXT, "P&L Jour: $---");
+    ObjectSetInteger(0, "XAUUSD_DailyPL", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_DailyPL", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_DailyPL", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(0, "XAUUSD_DailyPL", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_TradePL", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_TradePL", OBJPROP_TEXT, "P&L Trade: $---");
+    ObjectSetInteger(0, "XAUUSD_TradePL", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_TradePL", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_TradePL", OBJPROP_COLOR, clrOrange);
+    ObjectSetInteger(0, "XAUUSD_TradePL", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_Volatility", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_Volatility", OBJPROP_TEXT, "Volatilité: ---%");
+    ObjectSetInteger(0, "XAUUSD_Volatility", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Volatility", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Volatility", OBJPROP_COLOR, clrDodgerBlue);
+    ObjectSetInteger(0, "XAUUSD_Volatility", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_Trades", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_Trades", OBJPROP_TEXT, "Trades: 0/0");
+    ObjectSetInteger(0, "XAUUSD_Trades", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Trades", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Trades", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_Trades", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_Positions", OBJ_LABEL, 0, 0, 0); // NOUVEAU
+    ObjectSetString(0, "XAUUSD_Positions", OBJPROP_TEXT, "Pos: BUY=0 SELL=0");
+    ObjectSetInteger(0, "XAUUSD_Positions", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Positions", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Positions", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_Positions", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_Status", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_Status", OBJPROP_TEXT, "Status: ---");
+    ObjectSetInteger(0, "XAUUSD_Status", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_Status", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_Status", OBJPROP_COLOR, clrLime);
+    ObjectSetInteger(0, "XAUUSD_Status", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_SLMethod", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_SLMethod", OBJPROP_TEXT, "SL: ---");
+    ObjectSetInteger(0, "XAUUSD_SLMethod", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_SLMethod", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_SLMethod", OBJPROP_COLOR, clrYellow);
+    ObjectSetInteger(0, "XAUUSD_SLMethod", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_RiskBase", OBJ_LABEL, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_RiskBase", OBJPROP_TEXT, "Base Risque: Solde Courant");
+    ObjectSetInteger(0, "XAUUSD_RiskBase", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_RiskBase", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_RiskBase", OBJPROP_COLOR, UseCurrentBalanceForRisk ? clrGold : clrGray);
+    ObjectSetInteger(0, "XAUUSD_RiskBase", OBJPROP_FONTSIZE, 8);
+    
+    y += spacing;
+    
+    ObjectCreate(0, "XAUUSD_EmergencyBtn", OBJ_BUTTON, 0, 0, 0);
+    ObjectSetString(0, "XAUUSD_EmergencyBtn", OBJPROP_TEXT, "FERMER TOUT");
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_XDISTANCE, x);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_YDISTANCE, y);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_XSIZE, 100);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_YSIZE, 25);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_BGCOLOR, clrRed);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_COLOR, clrWhite);
+    ObjectSetInteger(0, "XAUUSD_EmergencyBtn", OBJPROP_FONTSIZE, 8);
+}
+
+//+------------------------------------------------------------------+
+//| UPDATE DASHBOARD                                                 |
+//+------------------------------------------------------------------+
+void UpdateDashboard()
+{
+    if(!UseVolatilityDashboard) return;
+    
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    double dailyPL = equity - DailyStartBalance;
+    
+    ObjectSetString(0, "XAUUSD_StartBalance", OBJPROP_TEXT, 
+                   "Solde Départ: $" + DoubleToString(DailyStartBalance, 2));
+    
+    color realizedColor = TodayRealizedPL >= 0 ? clrLime : clrRed;
+    ObjectSetString(0, "XAUUSD_RealizedPL", OBJPROP_TEXT, 
+                   "P&L Réalisé: $" + DoubleToString(TodayRealizedPL, 2));
+    ObjectSetInteger(0, "XAUUSD_RealizedPL", OBJPROP_COLOR, realizedColor);
+    
+    color currentBalanceColor = CurrentBalance >= DailyStartBalance ? clrLime : clrOrange;
+    ObjectSetString(0, "XAUUSD_CurrentBalance", OBJPROP_TEXT, 
+                   "SOLDE COURANT: $" + DoubleToString(CurrentBalance, 2));
+    ObjectSetInteger(0, "XAUUSD_CurrentBalance", OBJPROP_COLOR, currentBalanceColor);
+    
+    // Mise à jour statut multi-ordres (NOUVEAU)
+    int buyPos = CountOpenPositionsByType(POSITION_TYPE_BUY);
+    int sellPos = CountOpenPositionsByType(POSITION_TYPE_SELL);
+    string multiText = "Multi: " + IntegerToString(buyPos) + "B/" + IntegerToString(sellPos) + "S (max " + IntegerToString(MaxPositionsPerDirection) + ")";
+    color multiColor = (buyPos + sellPos) > 0 ? clrLime : clrGray;
+    ObjectSetString(0, "XAUUSD_MultiOrderStatus", OBJPROP_TEXT, multiText);
+    ObjectSetInteger(0, "XAUUSD_MultiOrderStatus", OBJPROP_COLOR, multiColor);
+    
+    // Mise à jour statut micro
+    string microText = "Micro: ";
+    color microColor = clrGray;
+    if(UseMicroTimeframes)
+    {
+       microText += "ON";
+       microColor = clrLime;
+       if(UseMicro5s) microText += " 5s";
+       if(UseMicro10s) microText += " 10s";
+       if(UseMicro15s) microText += " 15s";
+       if(UseMicro20s) microText += " 20s";
+       if(UseMicro30s) microText += " 30s";
+    }
+    else microText += "OFF";
+    ObjectSetString(0, "XAUUSD_MicroStatus", OBJPROP_TEXT, microText);
+    ObjectSetInteger(0, "XAUUSD_MicroStatus", OBJPROP_COLOR, microColor);
+    
+    ObjectSetString(0, "XAUUSD_Balance", OBJPROP_TEXT, 
+                   "Balance Compte: $" + DoubleToString(balance, 2));
+    
+    color plColor = dailyPL >= 0 ? clrLime : clrRed;
+    ObjectSetString(0, "XAUUSD_DailyPL", OBJPROP_TEXT, "P&L Jour: $" + DoubleToString(dailyPL, 2));
+    ObjectSetInteger(0, "XAUUSD_DailyPL", OBJPROP_COLOR, plColor);
+    
+    double tradePL = equity - DailyStartBalance;
+    color tradeColor = tradePL >= 0 ? clrLime : clrOrange;
+    ObjectSetString(0, "XAUUSD_TradePL", OBJPROP_TEXT, 
+                   "P&L Flottant: $" + DoubleToString(tradePL, 2));
+    ObjectSetInteger(0, "XAUUSD_TradePL", OBJPROP_COLOR, tradeColor);
+    
+    string volStatus = "Vol: ";
+    if(CurrentVolatility > AverageVolatility * 2.0)
+        volStatus += "EXTREME " + DoubleToString(CurrentVolatility, 2) + "%";
+    else if(CurrentVolatility > AverageVolatility * 1.5)
+        volStatus += "HAUTE " + DoubleToString(CurrentVolatility, 2) + "%";
+    else if(CurrentVolatility < AverageVolatility * 0.5)
+        volStatus += "BASSE " + DoubleToString(CurrentVolatility, 2) + "%";
+    else
+        volStatus += "NORMALE " + DoubleToString(CurrentVolatility, 2) + "%";
+    
+    color volStatusColor = CurrentVolatility > AverageVolatility * 1.5 ? clrOrangeRed : 
+                          CurrentVolatility > AverageVolatility * 0.5 ? clrDodgerBlue : clrGray;
+    ObjectSetString(0, "XAUUSD_VolStatus", OBJPROP_TEXT, volStatus);
+    ObjectSetInteger(0, "XAUUSD_VolStatus", OBJPROP_COLOR, volStatusColor);
+    
+    color volColor = CurrentVolatility > AverageVolatility * 1.5 ? clrOrangeRed : 
+                    CurrentVolatility > AverageVolatility * 0.5 ? clrDodgerBlue : clrGray;
+    ObjectSetString(0, "XAUUSD_Volatility", OBJPROP_TEXT, 
+                   "Volatilité: " + DoubleToString(CurrentVolatility, 2) + "%");
+    ObjectSetInteger(0, "XAUUSD_Volatility", OBJPROP_COLOR, volColor);
+    
+    ObjectSetString(0, "XAUUSD_Trades", OBJPROP_TEXT, 
+                   "Trades: " + (string)TradesToday + "/" + (string)MaxTradesPerDay);
+    
+    // Positions ouvertes (NOUVEAU)
+    ObjectSetString(0, "XAUUSD_Positions", OBJPROP_TEXT, 
+                   "Pos: BUY=" + IntegerToString(buyPos) + " SELL=" + IntegerToString(sellPos) + " Total=" + IntegerToString(buyPos+sellPos) + "/" + IntegerToString(MaxTotalPositions));
+    
+    color statusColor = EnableTrading ? (CheckTimeFilter() ? clrLime : clrOrange) : clrRed;
+    string statusText = EnableTrading ? (CheckTimeFilter() ? "ACTIF" : "EN ATTENTE") : "PAUSE";
+    ObjectSetString(0, "XAUUSD_Status", OBJPROP_TEXT, "Status: " + statusText);
+    ObjectSetInteger(0, "XAUUSD_Status", OBJPROP_COLOR, statusColor);
+    
+    string slMethodText = "";
+    switch(SL_Method)
+    {
+       case SL_ATR_ADAPTIVE: slMethodText = "ATR Adaptatif"; break;
+       case SL_SWING_POINTS: slMethodText = "Swings"; break;
+       case SL_SUPPORT_RESISTANCE: slMethodText = "S/R Levels"; break;
+       case SL_HYBRID: slMethodText = "Hybride"; break;
+    }
+    ObjectSetString(0, "XAUUSD_SLMethod", OBJPROP_TEXT, "SL: " + slMethodText);
+    ObjectSetInteger(0, "XAUUSD_SLMethod", OBJPROP_COLOR, clrLime);
+    
+    string riskBaseText = UseCurrentBalanceForRisk ? 
+                         "Base Risque: Solde Courant ⭐" : 
+                         "Base Risque: Solde Compte";
+    color riskBaseColor = UseCurrentBalanceForRisk ? clrGold : clrGray;
+    ObjectSetString(0, "XAUUSD_RiskBase", OBJPROP_TEXT, riskBaseText);
+    ObjectSetInteger(0, "XAUUSD_RiskBase", OBJPROP_COLOR, riskBaseColor);
+    
+    color bgColor = clrBlack;
+    if(TodayRealizedPL > DailyStartBalance * 0.02)
+        bgColor = C'0,20,0';
+    else if(TodayRealizedPL < -DailyStartBalance * 0.01)
+        bgColor = C'20,0,0';
+    
+    ObjectSetInteger(0, "XAUUSD_Dashboard_BG", OBJPROP_BGCOLOR, bgColor);
+}
+
+//+------------------------------------------------------------------+
+//| ONTRADE                                                          |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   CalculateTodayRealizedPL();
+   UpdateCurrentBalance();
+
+   if(EnableLogging)
+   {
+      Print("🔄 Trade exécuté - P&L réalisé: $", DoubleToString(TodayRealizedPL, 2));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| COMPTAGE: n'incrémente TradesToday que sur ENTRÉE réelle         |
+//| (évite de compter les ordres en attente non exécutés / expirés)  |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.symbol != _Symbol) return;
+
+   if(!HistoryDealSelect(trans.deal)) return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic) return;
+
+   // On ne compte que les entrées réelles (position ouverte), pas les sorties
+   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_IN) return;
+
+   TradesToday++;
+   VolatilityTradesToday++;
+   stats.totalTrades++;
+
+   if(EnableLogging)
+      Print("📈 Trade réellement exécuté #", TradesToday, "/", MaxTradesPerDay);
+}
+
+//+------------------------------------------------------------------+
+//| VALIDATE TRADE CONDITIONS                                        |
+//+------------------------------------------------------------------+
+bool ValidateTradeConditions(ENUM_ORDER_TYPE orderType)
+{
+   if(UseRSIFilter && RSI_Handle != INVALID_HANDLE)
+   {
+      double rsiBuffer[];
+      ArraySetAsSeries(rsiBuffer, true);
+      
+      if(CopyBuffer(RSI_Handle, 0, 0, 1, rsiBuffer) > 0)
+      {
+         double rsiValue = rsiBuffer[0];
+         
+         if(orderType == ORDER_TYPE_BUY_STOP && rsiValue > RSI_Overbought)
+         {
+            if(EnableLogging) Print("RSI bloqué: ", rsiValue, " > ", RSI_Overbought);
+            return false;
+         }
+         
+         if(orderType == ORDER_TYPE_SELL_STOP && rsiValue < RSI_Oversold)
+         {
+            if(EnableLogging) Print("RSI bloqué: ", rsiValue, " < ", RSI_Oversold);
+            return false;
+         }
+      }
+   }
+   
+   if(UseADXFilter && ADX_Handle != INVALID_HANDLE)
+   {
+      double adxBuffer[];
+      ArraySetAsSeries(adxBuffer, true);
+      
+      if(CopyBuffer(ADX_Handle, 0, 0, 1, adxBuffer) > 0)
+      {
+         double adxValue = adxBuffer[0];
+         
+         if(adxValue < ADX_MinValue)
+         {
+            if(EnableLogging) Print("ADX trop faible: ", adxValue, " < ", ADX_MinValue);
+            return false;
+         }
+      }
+   }
+   
+   if(DetectCandlePatterns()) { /* Confirmation */ }
+   if(AnalyzeVolume()) { /* Confirmation */ }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK TRADE COOLDOWN                                             |
+//+------------------------------------------------------------------+
+bool CheckTradeCooldown()
+{
+   if(LastTradeTime == 0) return true;
+   
+   int secondsSinceLastTrade = (int)(TimeCurrent() - LastTradeTime);
+   int cooldownSeconds = TradeCooldownMinutes * 60;
+   
+   if(secondsSinceLastTrade < cooldownSeconds)
+   {
+      if(EnableLogging) Print("Cooldown actif: ", cooldownSeconds - secondsSinceLastTrade, "s restantes");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| UPDATE CONSECUTIVE LOSSES                                        |
+//+------------------------------------------------------------------+
+void UpdateConsecutiveLosses()
+{
+   static datetime lastCheck = 0;
+   if(TimeCurrent() - lastCheck < 60) return;
+   lastCheck = TimeCurrent();
+   
+   HistorySelect(0, TimeCurrent());
+   int totalDeals = HistoryDealsTotal();
+   
+   int recentLosses = 0;
+   for(int i = totalDeals - 1; i >= MathMax(0, totalDeals - 5); i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(dealTime < LastTradingDay) break;
+      
+      double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      
+      if(profit < 0) recentLosses++;
+      else break;
+   }
+   
+   ConsecutiveLosses = recentLosses;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK SPREAD                                                     |
+//+------------------------------------------------------------------+
+bool CheckSpread()
+{
+   long currentSpread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   
+   if(currentSpread > MaxSpreadPoints)
+   {
+      if(EnableLogging) Print("Spread trop élevé: ", currentSpread, " > ", MaxSpreadPoints);
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK PRICE GAP                                                  |
+//+------------------------------------------------------------------+
+bool CheckPriceGap()
+{
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double prevClose = iClose(_Symbol, InpTimeframe, 1);
+   
+   if(prevClose == 0) return true;
+   
+   double gapAsk = MathAbs(currentAsk - prevClose) / _Point;
+   double gapBid = MathAbs(currentBid - prevClose) / _Point;
+   double maxGap = MathMax(gapAsk, gapBid);
+   
+   if(maxGap > MaxGapPoints)
+   {
+      if(EnableLogging) Print("Gap trop important: ", maxGap, " points");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| MANAGE TRAILING STOP                                             |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   ScanPositionsForSLManagement();
+}
+
+//+------------------------------------------------------------------+
+//| DISPLAY INFO                                                     |
+//+------------------------------------------------------------------+
+void DisplayInfo()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dailyPL = equity - DailyStartBalance;
+   double dailyPLPercent = (dailyPL / DailyStartBalance) * 100;
+   
+   int buyPositions = CountOpenPositionsByType(POSITION_TYPE_BUY);
+   int sellPositions = CountOpenPositionsByType(POSITION_TYPE_SELL);
+   
+   string balanceInfo = "";
+   if(UseCurrentBalanceForRisk)
+   {
+      balanceInfo = 
+         "=== SCALPING XAUUSD v9.7 - MULTI-ORDRES ===\n" +
+         "💰 Solde Départ: $" + DoubleToString(DailyStartBalance, 2) + "\n" +
+         "💰 P&L Réalisé Jour: $" + DoubleToString(TodayRealizedPL, 2) + "\n" +
+         "💰 SOLDE COURANT: $" + DoubleToString(CurrentBalance, 2) + " ⭐\n" +
+         "   (Utilisé pour calcul risque)\n";
+   }
+   else
+   {
+      balanceInfo = 
+         "=== SCALPING XAUUSD v9.7 ===\n" +
+         "💰 Solde Compte: $" + DoubleToString(balance, 2) + "\n" +
+         "💰 P&L Réalisé Jour: $" + DoubleToString(TodayRealizedPL, 2) + "\n" +
+         "💰 Solde Courant: $" + DoubleToString(CurrentBalance, 2) + "\n" +
+         "   (Non utilisé pour risque)\n";
+   }
+   
+   string multiInfo = 
+      "🔥 MULTI-ORDRES: " + IntegerToString(buyPositions) + "BUY / " + IntegerToString(sellPositions) + "SELL\n" +
+      "   Max/dir: " + IntegerToString(MaxPositionsPerDirection) + " | Total max: " + IntegerToString(MaxTotalPositions) + "\n" +
+      "   Pyramiding: " + (UsePyramidingLots ? "OUI x" + DoubleToString(LotMultiplier, 2) : "NON") + "\n" +
+      "   Hedging: " + (AllowHedging ? "AUTORISÉ" : "INTERDIT") + "\n";
+   
+   string microInfo = "";
+   if(UseMicroTimeframes)
+   {
+      microInfo = 
+         "⚡ MICRO-TIMEFRAMES: ACTIFS\n" +
+         "   5s=" + (string)UseMicro5s + " 10s=" + (string)UseMicro10s + 
+         " 15s=" + (string)UseMicro15s + " 20s=" + (string)UseMicro20s + 
+         " 30s=" + (string)UseMicro30s + "\n" +
+         "   Trades micro: 5s=" + IntegerToString(microCounts.count5s) + 
+         " 10s=" + IntegerToString(microCounts.count10s) + 
+         " 15s=" + IntegerToString(microCounts.count15s) + "\n";
+   }
+   
+   string info = balanceInfo +
+        multiInfo +
+        microInfo +
+        "Scan SL Rapide: ACTIF\n" +
+        "Scan Vol: TEMPS RÉEL (" + DoubleToString(CurrentVolatility, 2) + "%)\n" +
+        "Mode Vol: " + (HighVolatilityMode ? "HAUTE (Risque " + DoubleToString(VolatilityRiskMultiplier*100,0) + "%)" : "NORMALE") + "\n" +
+        "Positions suivies: " + (string)PositionsDataCount + "\n" +
+        "Symbole: " + _Symbol + "\n" +
+        "Balance: $" + DoubleToString(balance, 2) + "\n" +
+        "Equity: $" + DoubleToString(equity, 2) + "\n" +
+        "P&L Jour: $" + DoubleToString(dailyPL, 2) + " (" + DoubleToString(dailyPLPercent, 2) + "%)\n" +
+        "Trades Aujourd'hui: " + (string)TradesToday + "/" + (string)MaxTradesPerDay + "\n" +
+        "Pertes Consécutives: " + (string)ConsecutiveLosses + "/" + (string)MaxConsecutiveLosses + "\n" +
+        "SL Méthode: " + EnumToString(SL_Method) + "\n" +
+        "Rapid SL: " + (UseRapidSLMovement ? "ON" : "OFF") + "\n" +
+        "Positions: BUY=" + (string)buyPositions + " SELL=" + (string)sellPositions + "\n" +
+        "Spread: " + (string)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) + " points\n" +
+        "Status: " + (EnableTrading ? "ACTIF" : "PAUSE") + "\n" +
+        "Session: " + (CheckTimeFilter() ? "ACTIVE" : "FERMÉE") + "\n" +
+        "Sniper AI: " + (UseSniperAI ? ("ON score=" + DoubleToString(LastSniperSignal.score, 1) +
+                        " dir=" + (string)LastSniperSignal.direction +
+                        " seuil=" + (string)SniperMinScore) : "OFF");
+
+   Comment(info);
+}
+
+//+------------------------------------------------------------------+
+//| FONCTIONS VOLATILITÉ                                             |
+//+------------------------------------------------------------------+
+double CalculateIntradayVolatility()
+{
+   double highs[], lows[];
+   int count = VolatilityPeriod * 24;
+   if(count > 1000) count = 1000;
+   
+   ArrayResize(highs, count);
+   ArrayResize(lows, count);
+   
+   for(int i = 0; i < count; i++)
+   {
+      highs[i] = iHigh(_Symbol, PERIOD_H1, i);
+      lows[i] = iLow(_Symbol, PERIOD_H1, i);
+   }
+   
+   double sumRange = 0;
+   int validCount = 0;
+   
+   for(int i = 0; i < count; i++)
+   {
+      if(highs[i] > 0 && lows[i] > 0 && highs[i] > lows[i])
+      {
+         sumRange += (highs[i] - lows[i]) / highs[i];
+         validCount++;
+      }
+   }
+   
+   if(validCount == 0) return 0;
+   return (sumRange / validCount) * 100;
+}
+
+double CalculateHistoricalVolatility(int period = 20)
+{
+   double returns[];
+   ArrayResize(returns, period-1);
+   
+   for(int i = 0; i < period-1; i++)
+   {
+      double close1 = iClose(_Symbol, PERIOD_D1, i);
+      double close2 = iClose(_Symbol, PERIOD_D1, i+1);
+      
+      if(close2 > 0)
+         returns[i] = (close1 - close2) / close2;
+      else
+         returns[i] = 0;
+   }
+   
+   double mean = 0;
+   for(int i = 0; i < ArraySize(returns); i++)
+      mean += returns[i];
+   mean /= ArraySize(returns);
+   
+   double variance = 0;
+   for(int i = 0; i < ArraySize(returns); i++)
+      variance += MathPow(returns[i] - mean, 2);
+   variance /= ArraySize(returns);
+   
+   return MathSqrt(variance) * MathSqrt(252);
+}
+
+bool AnalyzeVolatilityOpportunities()
+{
+   if(CurrentVolatility < AverageVolatility * 0.7)
+   {
+      if(EnableLogging && MathRand()%1000 < 10)
+         Print("📊 Volatilité basse détectée - Opportunité de range trading");
+      return true;
+   }
+   else if(CurrentVolatility > AverageVolatility * 1.3)
+   {
+      if(EnableLogging && MathRand()%1000 < 10)
+         Print("🚀 Volatilité élevée détectée - Momentum trading actif");
+      return true;
+   }
+   return false;
+}
+
+void AdjustParametersByVolatility()
+{
+   double volRatio = CurrentVolatility / AverageVolatility;
+   volRatio = MathMax(0.5, MathMin(2.0, volRatio));
+   
+   if(UseDynamicStops)
+   {
+      double adjustedATRMultiplierSL = ATR_Multiplier_SL * volRatio;
+      double adjustedATRMultiplierTP = ATR_Multiplier_TP * volRatio;
+      
+      if(adjustedATRMultiplierTP / adjustedATRMultiplierSL < MinRiskRewardRatio)
+         adjustedATRMultiplierTP = adjustedATRMultiplierSL * MinRiskRewardRatio;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| VALIDATE VOLATILITY CONDITIONS                                   |
+//+------------------------------------------------------------------+
+bool ValidateVolatilityConditions()
+{
+   if(CurrentVolatility < MinVolatilityPercent)
+   {
+      if(EnableLogging) Print("Volatilité trop faible: ", CurrentVolatility, "% < ", MinVolatilityPercent, "%");
+      return false;
+   }
+   
+   if(CurrentVolatility > MaxVolatilityPercent)
+   {
+      if(!AllowHighVolatilityTrading)
+      {
+         if(EnableLogging) Print("Volatilité trop élevée: ", CurrentVolatility, "% > ", MaxVolatilityPercent, "%");
+         return false;
+      }
+      else
+      {
+         if(EnableLogging) Print("⚠️ Haute volatilité détectée: ", CurrentVolatility, 
+                                "% - Trading réduit à ", DoubleToString(HighVolatilityRiskFactor*100,0), "%");
+         return true;
+      }
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| DETECT CANDLE PATTERNS                                          |
+//+------------------------------------------------------------------+
+bool DetectCandlePatterns()
+{
+   double open1 = iOpen(_Symbol, InpTimeframe, 1);
+   double close1 = iClose(_Symbol, InpTimeframe, 1);
+   double high1 = iHigh(_Symbol, InpTimeframe, 1);
+   double low1 = iLow(_Symbol, InpTimeframe, 1);
+   
+   if(high1 - low1 == 0) return false;
+   
+   if(MathAbs(close1 - open1) / (high1 - low1) < 0.1 && (high1 - low1) > 20 * _Point)
+   {
+      if(EnableLogging) Print("🕯️ Doji détecté - indécision du marché");
+      return true;
+   }
+   
+   double upperShadow = high1 - MathMax(open1, close1);
+   double lowerShadow = MathMin(open1, close1) - low1;
+   double body = MathAbs(close1 - open1);
+   
+   if(lowerShadow > body * 2 && upperShadow < body * 0.1)
+   {
+      if(EnableLogging) Print("🔨 Hammer détecté - possible rebond haussier");
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ANALYZE VOLUME                                                  |
+//+------------------------------------------------------------------+
+bool AnalyzeVolume()
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   
+   if(CopyRates(_Symbol, InpTimeframe, 0, 3, rates) == 3)
+   {
+      double avgVolume = ((double)rates[1].tick_volume + (double)rates[2].tick_volume) / 2.0;
+      if((double)rates[0].tick_volume > avgVolume * 2.0)
+      {
+         if(EnableLogging) Print("📊 Volume élevé détecté - intérêt du marché");
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ANALYZE MARKET CORRELATIONS                                     |
+//+------------------------------------------------------------------+
+void AnalyzeMarketCorrelations()
+{
+   string correlatedPairs[] = {"EURUSD", "USDJPY", "DXY", "USOIL", "SPX500"};
+   
+   for(int i = 0; i < ArraySize(correlatedPairs); i++)
+   {
+      if(SymbolInfoInteger(correlatedPairs[i], SYMBOL_SELECT))
+      {
+         double correlation = CalculateCorrelation(_Symbol, correlatedPairs[i], PERIOD_H4, 50);
+         if(MathAbs(correlation) > 0.6)
+         {
+            if(EnableLogging) 
+               Print("🔗 Corrélation avec " + correlatedPairs[i] + ": " + DoubleToString(correlation, 2));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CALCULATE CORRELATION                                           |
+//+------------------------------------------------------------------+
+double CalculateCorrelation(string symbol1, string symbol2, ENUM_TIMEFRAMES tf, int period)
+{
+   double prices1[], prices2[];
+   ArrayResize(prices1, period);
+   ArrayResize(prices2, period);
+   
+   for(int i = 0; i < period; i++)
+   {
+      prices1[i] = iClose(symbol1, tf, i);
+      prices2[i] = iClose(symbol2, tf, i);
+   }
+   
+   double mean1 = 0, mean2 = 0;
+   for(int i = 0; i < period; i++)
+   {
+      mean1 += prices1[i];
+      mean2 += prices2[i];
+   }
+   mean1 /= period;
+   mean2 /= period;
+   
+   double numerator = 0, denom1 = 0, denom2 = 0;
+   for(int i = 0; i < period; i++)
+   {
+      double diff1 = prices1[i] - mean1;
+      double diff2 = prices2[i] - mean2;
+      numerator += diff1 * diff2;
+      denom1 += diff1 * diff1;
+      denom2 += diff2 * diff2;
+   }
+   
+   if(denom1 == 0 || denom2 == 0) return 0;
+   return numerator / MathSqrt(denom1 * denom2);
+}
+
+//+------------------------------------------------------------------+
+//| DETECT KEY LEVELS                                               |
+//+------------------------------------------------------------------+
+void DetectKeyLevels(double &support[], double &resistance[])
+{
+   int lookback = 100;
+   ArrayResize(support, 0);
+   ArrayResize(resistance, 0);
+   
+   for(int i = 2; i < lookback - 2; i++)
+   {
+      double high0 = iHigh(_Symbol, PERIOD_H4, i);
+      double high1 = iHigh(_Symbol, PERIOD_H4, i-1);
+      double high2 = iHigh(_Symbol, PERIOD_H4, i+1);
+      double high3 = iHigh(_Symbol, PERIOD_H4, i-2);
+      double high4 = iHigh(_Symbol, PERIOD_H4, i+2);
+      
+      if(high0 > high1 && high0 > high2 &&
+         MathAbs(high0 - high3) / _Point < 100 &&
+         MathAbs(high0 - high4) / _Point < 100)
+      {
+         int size = ArraySize(resistance);
+         ArrayResize(resistance, size + 1);
+         resistance[size] = high0;
+      }
+   }
+   
+   for(int i = 2; i < lookback - 2; i++)
+   {
+      double low0 = iLow(_Symbol, PERIOD_H4, i);
+      double low1 = iLow(_Symbol, PERIOD_H4, i-1);
+      double low2 = iLow(_Symbol, PERIOD_H4, i+1);
+      double low3 = iLow(_Symbol, PERIOD_H4, i-2);
+      double low4 = iLow(_Symbol, PERIOD_H4, i+2);
+      
+      if(low0 < low1 && low0 < low2 &&
+         MathAbs(low0 - low3) / _Point < 100 &&
+         MathAbs(low0 - low4) / _Point < 100)
+      {
+         int size = ArraySize(support);
+         ArrayResize(support, size + 1);
+         support[size] = low0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DRAW SUPPORT RESISTANCE LEVELS                                  |
+//+------------------------------------------------------------------+
+void DrawSupportResistanceLevels(double &support[], double &resistance[])
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, "SR_") == 0)
+         ObjectDelete(0, name);
+   }
+   
+   for(int i = 0; i < ArraySize(support); i++)
+   {
+      string name = "SR_Support_" + IntegerToString(i);
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, support[i]);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrDodgerBlue);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectSetString(0, name, OBJPROP_TEXT, "S" + IntegerToString(i+1));
+   }
+   
+   for(int i = 0; i < ArraySize(resistance); i++)
+   {
+      string name = "SR_Resistance_" + IntegerToString(i);
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, resistance[i]);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrOrangeRed);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectSetString(0, name, OBJPROP_TEXT, "R" + IntegerToString(i+1));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHECK XAUUSD ONLY                                               |
+//+------------------------------------------------------------------+
+bool CheckXAUUSDOnly()
+{
+   if(ForceXAUUSDonly && StringFind(_Symbol, "XAUUSD") < 0)
+   {
+      Print("ATTENTION: Cet EA est conçu uniquement pour XAUUSD. Trading désactivé.");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| UPDATE TRADE STATS                                              |
+//+------------------------------------------------------------------+
+void UpdateTradeStats(double profit)
+{
+   stats.totalProfit += profit;
+   if(profit > 0)
+   {
+      stats.winningTrades++;
+      if(profit > stats.maxProfit)
+         stats.maxProfit = profit;
+   }
+   else
+   {
+      stats.losingTrades++;
+      if(profit < stats.maxLoss)
+         stats.maxLoss = profit;
+   }
+   if(stats.totalTrades > 0)
+      stats.winRate = (double)stats.winningTrades / stats.totalTrades * 100;
+}
+
+//+------------------------------------------------------------------+
+//| ON CHART EVENT                                                  |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == "XAUUSD_EmergencyBtn")
+      {
+         CloseAllOrdersAndPositions();
+         Alert("🚨 Fermeture d'urgence activée !");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| FONCTIONS UTILITAIRES                                           |
+//+------------------------------------------------------------------+
+double FindSignificantHigh()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int half = BarsN / 2;
+   
+   for(int i = BarsN; i < BarsLookback; i++)
+   {
+      double center = iHigh(_Symbol, InpTimeframe, i);
+      bool isHigh = true;
+      
+      for(int j = 1; j <= half; j++)
+      {
+         if(iHigh(_Symbol, InpTimeframe, i + j) >= center || 
+            iHigh(_Symbol, InpTimeframe, i - j) >= center)
+         {
+            isHigh = false;
+            break;
+         }
+      }
+      
+      if(isHigh && (center - ask) / _Point >= MinDistPoints)
+         return center;
+   }
+   return -1;
+}
+
+double FindSignificantLow()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int half = BarsN / 2;
+   
+   for(int i = BarsN; i < BarsLookback; i++)
+   {
+      double center = iLow(_Symbol, InpTimeframe, i);
+      bool isLow = true;
+      
+      for(int j = 1; j <= half; j++)
+      {
+         if(iLow(_Symbol, InpTimeframe, i + j) <= center || 
+            iLow(_Symbol, InpTimeframe, i - j) <= center)
+         {
+            isLow = false;
+            break;
+         }
+      }
+      
+      if(isLow && (bid - center) / _Point >= MinDistPoints)
+         return center;
+   }
+   return -1;
+}
+
+bool ValidateDistance(double level, ENUM_ORDER_TYPE orderType)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   if(orderType == ORDER_TYPE_BUY_STOP)
+      return ((level - ask) / _Point >= MinDistPoints);
+   else
+      return ((bid - level) / _Point >= MinDistPoints);
+}
+
+bool IsNewBar()
+{
+   static datetime prevBar = 0;
+   datetime currBar = iTime(_Symbol, InpTimeframe, 0);
+   
+   if(currBar != prevBar)
+   {
+      prevBar = currBar;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| SNIPER AI: collecte du tick courant dans le buffer circulaire    |
+//+------------------------------------------------------------------+
+void SniperCollectTick()
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+   if(tick.time == 0) return;
+
+   // Dédoublonner sur le même timestamp + prix
+   if(SniperBufCount > 0)
+   {
+      int lastIdx = (SniperBufHead - 1 + SNIPER_BUF_SIZE) % SNIPER_BUF_SIZE;
+      if(SniperBuf[lastIdx].time == tick.time &&
+         SniperBuf[lastIdx].bid  == tick.bid)
+         return;
+   }
+
+   SniperBuf[SniperBufHead].time   = tick.time;
+   SniperBuf[SniperBufHead].bid    = tick.bid;
+   SniperBuf[SniperBufHead].ask    = tick.ask;
+   SniperBuf[SniperBufHead].volume = (long)tick.volume;
+
+   SniperBufHead = (SniperBufHead + 1) % SNIPER_BUF_SIZE;
+   if(SniperBufCount < SNIPER_BUF_SIZE) SniperBufCount++;
+}
+
+//+------------------------------------------------------------------+
+//| SNIPER AI: helper - récupère le Nème tick le plus récent         |
+//+------------------------------------------------------------------+
+bool SniperGetTick(int nBack, SniperTick &out)
+{
+   if(nBack < 0 || nBack >= SniperBufCount) return false;
+   int idx = (SniperBufHead - 1 - nBack + SNIPER_BUF_SIZE * 2) % SNIPER_BUF_SIZE;
+   out = SniperBuf[idx];
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| SNIPER AI: scoring prédictif multi-facteurs temps réel           |
+//| Retourne score 0..100 + direction ±1                             |
+//+------------------------------------------------------------------+
+SniperSignal SniperEvaluate()
+{
+   SniperSignal sig;
+   sig.score = 0;
+   sig.direction = 0;
+   sig.momentum = 0; sig.acceleration = 0; sig.rsiScore = 0;
+   sig.volScore = 0; sig.confluenceScore = 0; sig.volumeScore = 0;
+   sig.reason = "";
+
+   int window = MathMin(SniperTickWindow, SniperBufCount);
+   if(window < 10) { sig.reason = "buffer insuffisant"; return sig; }
+
+   SniperTick t0, tMid, tEnd;
+   if(!SniperGetTick(0, t0)) return sig;
+   if(!SniperGetTick(window/2, tMid)) return sig;
+   if(!SniperGetTick(window-1, tEnd)) return sig;
+
+   double point = _Point > 0 ? _Point : 0.01;
+
+   // --- 1) MOMENTUM: variation prix (récent - ancien)
+   double deltaFull = (t0.bid - tEnd.bid) / point;           // pts
+   double momentumPts = deltaFull;
+   // Normaliser vers [0..1] par rapport à un seuil (30 pts sur la fenêtre)
+   double momentumNorm = MathMin(1.0, MathAbs(momentumPts) / 30.0);
+   sig.momentum = momentumNorm * SniperW_Momentum;
+   int dirMomentum = momentumPts > 0 ? 1 : (momentumPts < 0 ? -1 : 0);
+
+   // --- 2) ACCELERATION: 2e dérivée (récent vs milieu vs ancien)
+   double v1 = (t0.bid - tMid.bid) / point;      // vitesse récente
+   double v2 = (tMid.bid - tEnd.bid) / point;    // vitesse précédente
+   double accel = v1 - v2;
+   double accelNorm = MathMin(1.0, MathAbs(accel) / 15.0);
+   sig.acceleration = accelNorm * SniperW_Acceleration;
+   int dirAccel = accel > 0 ? 1 : (accel < 0 ? -1 : 0);
+
+   // --- 3) RSI (lecture indicateur existant)
+   int dirRSI = 0;
+   double rsiVal = 50.0;
+   if(RSI_Handle != INVALID_HANDLE)
+   {
+      double rsiBuf[];
+      ArraySetAsSeries(rsiBuf, true);
+      if(CopyBuffer(RSI_Handle, 0, 0, 1, rsiBuf) > 0)
+      {
+         rsiVal = rsiBuf[0];
+         // Zone propice: RSI pas en zone extrême contraire au mouvement
+         if(rsiVal < RSI_Overbought && rsiVal > 50) { dirRSI = 1; sig.rsiScore = SniperW_RSI * ((rsiVal - 50) / (RSI_Overbought - 50)); }
+         else if(rsiVal > RSI_Oversold && rsiVal < 50) { dirRSI = -1; sig.rsiScore = SniperW_RSI * ((50 - rsiVal) / (50 - RSI_Oversold)); }
+         else sig.rsiScore = 0;
+      }
+   }
+
+   // --- 4) REGIME DE VOLATILITE (ATR normalisé)
+   double atrPts = 0;
+   if(ATR_Handle != INVALID_HANDLE)
+   {
+      double atrBuf[];
+      ArraySetAsSeries(atrBuf, true);
+      if(CopyBuffer(ATR_Handle, 0, 0, 1, atrBuf) > 0)
+         atrPts = atrBuf[0] / point;
+   }
+   // Vol idéale pour sniper: ni trop faible (rien ne bouge) ni trop forte (chaos)
+   double volTarget = 200.0;
+   double volScoreRaw = 0;
+   if(atrPts > 0)
+      volScoreRaw = 1.0 - MathMin(1.0, MathAbs(atrPts - volTarget) / volTarget);
+   sig.volScore = volScoreRaw * SniperW_Volatility;
+
+   // --- 5) CONFLUENCE: S/R + direction momentum cohérente
+   double confluenceNorm = 0;
+   if(dirMomentum != 0 && dirAccel == dirMomentum) confluenceNorm += 0.5;
+   if(dirRSI != 0 && dirRSI == dirMomentum) confluenceNorm += 0.5;
+   sig.confluenceScore = confluenceNorm * SniperW_Confluence;
+
+   // --- 6) VOLUME TICK: activité récente vs moyenne
+   long volRecent = 0, volOlder = 0;
+   int half = window / 2;
+   for(int i = 0; i < half; i++)
+   {
+      SniperTick tk;
+      if(SniperGetTick(i, tk)) volRecent += tk.volume;
+   }
+   for(int i = half; i < window; i++)
+   {
+      SniperTick tk;
+      if(SniperGetTick(i, tk)) volOlder += tk.volume;
+   }
+   double volRatio = (volOlder > 0) ? (double)volRecent / (double)volOlder : 1.0;
+   double volRatioNorm = MathMin(1.0, MathMax(0.0, (volRatio - 0.8) / 1.2));
+   sig.volumeScore = volRatioNorm * SniperW_Volume;
+
+   // --- DIRECTION FINALE par vote pondéré
+   double voteBuy = 0, voteSell = 0;
+   if(dirMomentum > 0) voteBuy += SniperW_Momentum; else if(dirMomentum < 0) voteSell += SniperW_Momentum;
+   if(dirAccel    > 0) voteBuy += SniperW_Acceleration; else if(dirAccel < 0) voteSell += SniperW_Acceleration;
+   if(dirRSI      > 0) voteBuy += SniperW_RSI; else if(dirRSI < 0) voteSell += SniperW_RSI;
+   sig.direction = (voteBuy > voteSell) ? 1 : (voteSell > voteBuy ? -1 : 0);
+
+   // --- SCORE TOTAL
+   sig.score = sig.momentum + sig.acceleration + sig.rsiScore +
+               sig.volScore + sig.confluenceScore + sig.volumeScore;
+   if(sig.score > 100) sig.score = 100;
+
+   sig.reason = StringFormat("mom=%.1f acc=%.1f rsi=%.1f(%.0f) vol=%.1f(atr%.0f) conf=%.1f volT=%.1f dir=%d",
+                             sig.momentum, sig.acceleration, sig.rsiScore, rsiVal,
+                             sig.volScore, atrPts, sig.confluenceScore, sig.volumeScore,
+                             sig.direction);
+
+   LastSniperSignal = sig;
+   LastSniperEval = TimeCurrent();
+   return sig;
+}
+
+//+------------------------------------------------------------------+
+//| SNIPER AI: gate d'entrée - OK si score >= seuil + direction OK   |
+//+------------------------------------------------------------------+
+bool SniperAllowEntry(ENUM_ORDER_TYPE orderType)
+{
+   if(!UseSniperAI) return true;
+
+   SniperSignal sig = SniperEvaluate();
+
+   if(sig.score < SniperMinScore)
+   {
+      if(SniperLogScores)
+         PrintFormat("[Sniper] REJET: score=%.1f < %d | %s", sig.score, SniperMinScore, sig.reason);
+      return false;
+   }
+
+   if(SniperRequireAlignment)
+   {
+      bool isBuy = (orderType == ORDER_TYPE_BUY || orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY_LIMIT);
+      bool isSell = (orderType == ORDER_TYPE_SELL || orderType == ORDER_TYPE_SELL_STOP || orderType == ORDER_TYPE_SELL_LIMIT);
+      if(isBuy && sig.direction != 1)
+      {
+         if(SniperLogScores) PrintFormat("[Sniper] REJET BUY: direction=%d score=%.1f", sig.direction, sig.score);
+         return false;
+      }
+      if(isSell && sig.direction != -1)
+      {
+         if(SniperLogScores) PrintFormat("[Sniper] REJET SELL: direction=%d score=%.1f", sig.direction, sig.score);
+         return false;
+      }
+   }
+
+   if(SniperLogScores)
+      PrintFormat("[Sniper] OK: score=%.1f dir=%d | %s", sig.score, sig.direction, sig.reason);
+   return true;
+}
+
+bool CheckTimeFilter()
+{
+   // Trading 24/7 tant que le marché est ouvert (tick récent + session active)
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+   if(tick.time == 0 || (TimeCurrent() - tick.time) > 60)
+      return false;
+
+   // Si filtres horaires désactivés (valeur par défaut) → autoriser 24/7
+   if(SHInput == SH_Inactive && EHInput == EH_Inactive)
+      return true;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentHour = dt.hour;
+
+   int startHour = (int)SHInput;
+   int endHour = (int)EHInput;
+
+   if(startHour <= endHour)
+   {
+      if(currentHour >= startHour && currentHour <= endHour)
+         return true;
+   }
+   else
+   {
+      if(currentHour >= startHour || currentHour <= endHour)
+         return true;
+   }
+   return false;
+}
+
+bool CheckMargin(double lots)
+{
+   if(!UseMarginFilter) return true;
+   
+   double marginRequired = lots * SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   
+   if(freeMargin <= 0) return false;
+   double marginRatio = (marginRequired / freeMargin) * 100;
+   
+   return (marginRatio <= MaxMarginUsage);
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ALL ORDERS AND POSITIONS                                  |
+//+------------------------------------------------------------------+
+void CloseAllOrdersAndPositions()
+{
+   int closedCount = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
+         PositionGetString(POSITION_SYMBOL) == _Symbol)
+      {
+         if(trade.PositionClose(ticket))
+            closedCount++;
+      }
+   }
+   
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(OrderSelect(ticket))
+      {
+         if(OrderGetInteger(ORDER_MAGIC) == InpMagic && 
+            OrderGetString(ORDER_SYMBOL) == _Symbol)
+         {
+            if(trade.OrderDelete(ticket))
+               closedCount++;
+         }
+      }
+   }
+   
+   if(closedCount > 0)
+      Print("🚨 Fermeture d'urgence: ", closedCount, " positions/ordres fermés");
+}
+
+//+------------------------------------------------------------------+
