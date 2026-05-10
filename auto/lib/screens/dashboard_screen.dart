@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 import 'dart:math';
-import 'dart:async';
+import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/terminal_card.dart';
+import '../providers/trading_provider.dart';
+import '../providers/market_provider.dart';
 
 class DashboardScreen extends StatefulWidget {
-  final Stream<Map<String, dynamic>>? priceStream;
-  const DashboardScreen({super.key, this.priceStream});
+  const DashboardScreen({super.key});
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -16,25 +17,6 @@ class _DashboardScreenState extends State<DashboardScreen>
     with TickerProviderStateMixin {
   late AnimationController _pulse;
   late AnimationController _priceFlash;
-  late Timer _tickTimer;
-  final _rng = Random();
-
-  double _price = 2387.45;
-  double _prevPrice = 2387.45;
-  double _bid = 2387.42;
-  double _ask = 2387.48;
-  double _dayChange = 12.30;
-  double _dayPct = 0.52;
-  double _pnl = 847.20;
-  double _realized = 623.00;
-  double _floating = 224.20;
-  double _balance = 12847.20;
-  double _equity = 13071.40;
-  int _wins = 17;
-  int _total = 25;
-  int _sniperScore = 82;
-  double _pos1Pnl = 93.75;
-  double _pos2Pnl = 130.45;
 
   @override
   void initState() {
@@ -44,39 +26,12 @@ class _DashboardScreenState extends State<DashboardScreen>
       ..repeat(reverse: true);
     _priceFlash = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 300));
-
-    _tickTimer = Timer.periodic(const Duration(milliseconds: 800), (_) {
-      _simulateTick();
-    });
-  }
-
-  void _simulateTick() {
-    setState(() {
-      _prevPrice = _price;
-      final delta = (_rng.nextDouble() - 0.48) * 1.2;
-      _price = (_price + delta);
-      _bid = _price - 0.03;
-      _ask = _price + 0.03;
-      _dayChange += delta * 0.1;
-      _dayPct = _dayChange / _price * 100;
-
-      _floating += delta * 0.5;
-      _pnl = _realized + _floating;
-      _equity = _balance + _floating;
-
-      _pos1Pnl += (_rng.nextDouble() - 0.45) * 2;
-      _pos2Pnl += (_rng.nextDouble() - 0.45) * 2;
-
-      _sniperScore = (_sniperScore + (_rng.nextInt(5) - 2)).clamp(60, 98);
-    });
-    _priceFlash.forward(from: 0);
   }
 
   @override
   void dispose() {
     _pulse.dispose();
     _priceFlash.dispose();
-    _tickTimer.cancel();
     super.dispose();
   }
 
@@ -103,8 +58,6 @@ class _DashboardScreenState extends State<DashboardScreen>
           _positions(),
           const SizedBox(height: 8),
           _controls(),
-          const SizedBox(height: 8),
-          _history(),
           const SizedBox(height: 16),
         ],
       ),
@@ -112,13 +65,18 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _statusBar() {
+    final trading = context.watch<TradingProvider>();
+    final isRunning = trading.engineStatus == EngineStatus.running;
+    final statusColor = isRunning ? AppColors.green : AppColors.red;
+    final statusText = trading.engineStatus.name.toUpperCase();
+
     return AnimatedBuilder(
       animation: _pulse,
       builder: (_, __) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: AppColors.green.withValues(alpha: 0.08),
-          border: Border.all(color: AppColors.green.withValues(alpha: 0.3)),
+          color: statusColor.withValues(alpha: 0.08),
+          border: Border.all(color: statusColor.withValues(alpha: 0.3)),
         ),
         child: Row(
           children: [
@@ -127,32 +85,35 @@ class _DashboardScreenState extends State<DashboardScreen>
               height: 8,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: AppColors.green
-                    .withValues(alpha: 0.5 + _pulse.value * 0.5),
+                color: statusColor
+                    .withValues(alpha: isRunning ? 0.5 + _pulse.value * 0.5 : 0.5),
                 boxShadow: [
                   BoxShadow(
-                      color: AppColors.green.withValues(alpha: 0.4),
+                      color: statusColor.withValues(alpha: 0.4),
                       blurRadius: 8),
                 ],
               ),
             ),
             const SizedBox(width: 8),
-            Text('ENGINE RUNNING',
+            Text('ENGINE $statusText',
                 style: monoStyle(
                     fontSize: 11,
-                    color: AppColors.green,
+                    color: statusColor,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 1)),
             const Spacer(),
-            Text('UPTIME 14h 32m',
+            if (trading.adaptiveSafeMode)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                color: AppColors.amber.withValues(alpha: 0.2),
+                child: Text('SAFE MODE',
+                    style: monoStyle(fontSize: 9, color: AppColors.amber, fontWeight: FontWeight.bold)),
+              ),
+            const SizedBox(width: 8),
+            Text('${trading.regime}',
                 style: monoStyle(
                     fontSize: 10,
-                    color: AppColors.green.withValues(alpha: 0.7))),
-            const SizedBox(width: 12),
-            Text('LAT 2.1ms',
-                style: monoStyle(
-                    fontSize: 10,
-                    color: AppColors.green.withValues(alpha: 0.7))),
+                    color: statusColor.withValues(alpha: 0.7))),
           ],
         ),
       ),
@@ -160,7 +121,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _marketTicker() {
-    final priceUp = _price >= _prevPrice;
+    final market = context.watch<MarketProvider>();
+    final bid = market.bid;
+    final ask = market.ask;
+    final spread = market.spread;
+    final priceUp = bid >= market.prevBid;
     final flashColor = priceUp ? AppColors.green : AppColors.red;
 
     return TerminalCard(
@@ -177,16 +142,12 @@ class _DashboardScreenState extends State<DashboardScreen>
               const SizedBox(width: 8),
               TerminalBadge(label: 'GOLD', color: AppColors.amber),
               const Spacer(),
-              AnimatedBuilder(
-                animation: _priceFlash,
-                builder: (_, __) => Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: flashColor
-                        .withValues(alpha: 1.0 - _priceFlash.value),
-                  ),
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: bid > 0 ? AppColors.green : AppColors.red,
                 ),
               ),
             ],
@@ -195,79 +156,34 @@ class _DashboardScreenState extends State<DashboardScreen>
           Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              AnimatedBuilder(
-                animation: _priceFlash,
-                builder: (_, __) {
-                  final bgAlpha = (1.0 - _priceFlash.value) * 0.15;
-                  return Container(
-                    color: flashColor.withValues(alpha: bgAlpha),
-                    padding: const EdgeInsets.symmetric(horizontal: 2),
-                    child: Text(
-                      _price.toStringAsFixed(0).replaceAllMapped(
-                          RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
-                          (m) => '${m[1]},'),
-                      style: monoStyle(
-                          fontSize: 32,
-                          color: Colors.white,
-                          fontWeight: FontWeight.w300),
-                    ),
-                  );
-                },
-              ),
-              AnimatedBuilder(
-                animation: _priceFlash,
-                builder: (_, __) {
-                  final bgAlpha = (1.0 - _priceFlash.value) * 0.2;
-                  return Container(
-                    color: flashColor.withValues(alpha: bgAlpha),
-                    padding: const EdgeInsets.symmetric(horizontal: 1),
-                    child: Text(
-                      '.${(_price * 100 % 100).toInt().toString().padLeft(2, '0')}',
-                      style: monoStyle(
-                          fontSize: 22,
-                          color: AppColors.cyan,
-                          fontWeight: FontWeight.bold),
-                    ),
-                  );
-                },
-              ),
-              const SizedBox(width: 12),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                color: (_dayChange >= 0 ? AppColors.green : AppColors.red)
-                    .withValues(alpha: 0.15),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                        _dayChange >= 0
-                            ? Icons.arrow_drop_up
-                            : Icons.arrow_drop_down,
-                        color: _dayChange >= 0
-                            ? AppColors.green
-                            : AppColors.red,
-                        size: 16),
-                    Text(
-                        '${_dayChange >= 0 ? "+" : ""}${_dayChange.toStringAsFixed(2)} (${_dayPct.toStringAsFixed(2)}%)',
-                        style: monoStyle(
-                            fontSize: 11,
-                            color: _dayChange >= 0
-                                ? AppColors.green
-                                : AppColors.red)),
-                  ],
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: Text(
+                  bid > 0 ? bid.toStringAsFixed(0) : '---',
+                  style: monoStyle(
+                      fontSize: 32,
+                      color: Colors.white,
+                      fontWeight: FontWeight.w300),
                 ),
               ),
+              if (bid > 0)
+                Text(
+                  '.${((bid * 100) % 100).toInt().toString().padLeft(2, '0')}',
+                  style: monoStyle(
+                      fontSize: 22,
+                      color: flashColor,
+                      fontWeight: FontWeight.bold),
+                ),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              _stat('BID', _bid.toStringAsFixed(2)),
-              _stat('ASK', _ask.toStringAsFixed(2)),
-              _stat('SPREAD', (_ask - _bid).toStringAsFixed(2)),
-              _stat('ATR(14)', '18.4'),
-              _stat('VOL', 'HIGH', highlight: true),
+              _stat('BID', bid > 0 ? bid.toStringAsFixed(2) : '--'),
+              _stat('ASK', ask > 0 ? ask.toStringAsFixed(2) : '--'),
+              _stat('SPREAD', spread > 0 ? spread.toStringAsFixed(2) : '--'),
+              _stat('ATR', market.atr > 0 ? market.atr.toStringAsFixed(1) : '--'),
+              _stat('VOL', market.volatilityStatus, highlight: market.volatilityStatus == 'HIGH'),
             ],
           ),
         ],
@@ -297,6 +213,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _pnlCard() {
+    final trading = context.watch<TradingProvider>();
+    final pnl = trading.pnlToday + trading.floatingPl;
+    final realized = trading.pnlToday;
+    final floating = trading.floatingPl;
+
     return TerminalCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -307,32 +228,30 @@ class _DashboardScreenState extends State<DashboardScreen>
                   color: AppColors.dimText,
                   letterSpacing: 2)),
           const SizedBox(height: 6),
-          TweenAnimationBuilder<double>(
-            tween: Tween(end: _pnl),
-            duration: const Duration(milliseconds: 500),
-            builder: (_, val, __) => Text(
-                '${val >= 0 ? "+" : ""}\$${val.toStringAsFixed(2)}',
-                style: monoStyle(
-                    fontSize: 22,
-                    color: val >= 0 ? AppColors.green : AppColors.red,
-                    fontWeight: FontWeight.bold)),
-          ),
+          Text(
+              '${pnl >= 0 ? "+" : ""}\$${pnl.toStringAsFixed(2)}',
+              style: monoStyle(
+                  fontSize: 22,
+                  color: pnl >= 0 ? AppColors.green : AppColors.red,
+                  fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
           Row(
             children: [
               _mini('Realized',
-                  '+\$${_realized.toStringAsFixed(0)}', AppColors.green),
+                  '${realized >= 0 ? "+" : ""}\$${realized.toStringAsFixed(0)}', AppColors.green),
               const SizedBox(width: 8),
               _mini('Float',
-                  '${_floating >= 0 ? "+" : ""}\$${_floating.toStringAsFixed(0)}',
+                  '${floating >= 0 ? "+" : ""}\$${floating.toStringAsFixed(0)}',
                   AppColors.cyan),
             ],
           ),
           const SizedBox(height: 8),
           MiniBar(
-              ratio: _wins / _total, color: AppColors.green),
+              ratio: trading.tradesToday > 0 ? trading.winRate / 100 : 0,
+              color: AppColors.green),
           const SizedBox(height: 4),
-          Text('Win Rate ${(_wins / _total * 100).toInt()}% ($_wins/$_total)',
+          Text(
+              'Win Rate ${trading.winRate.toStringAsFixed(0)}% (${trading.tradesToday} trades)',
               style: monoStyle(fontSize: 9, color: AppColors.dimText)),
         ],
       ),
@@ -340,6 +259,8 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _accountCard() {
+    final trading = context.watch<TradingProvider>();
+
     return TerminalCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -350,29 +271,30 @@ class _DashboardScreenState extends State<DashboardScreen>
                   color: AppColors.dimText,
                   letterSpacing: 2)),
           const SizedBox(height: 6),
-          TweenAnimationBuilder<double>(
-            tween: Tween(end: _balance),
-            duration: const Duration(milliseconds: 500),
-            builder: (_, val, __) => Text(
-                '\$${val.toStringAsFixed(2)}',
-                style: monoStyle(
-                    fontSize: 22,
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold)),
-          ),
+          Text(
+              '\$${trading.balance.toStringAsFixed(2)}',
+              style: monoStyle(
+                  fontSize: 22,
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
           Row(
             children: [
-              _mini('Equity', '\$${_equity.toStringAsFixed(0)}',
+              _mini('Equity', '\$${trading.equity.toStringAsFixed(0)}',
                   AppColors.text),
               const SizedBox(width: 8),
-              _mini('Margin', '\$1,240', AppColors.amber),
+              _mini('Losses', '${trading.consecutiveLosses}', AppColors.amber),
             ],
           ),
           const SizedBox(height: 8),
-          const MiniBar(ratio: 0.32, color: AppColors.amber),
+          MiniBar(
+              ratio: trading.balance > 0
+                  ? (trading.pnlToday.abs() / (trading.balance * 0.03)).clamp(0, 1)
+                  : 0,
+              color: AppColors.amber),
           const SizedBox(height: 4),
-          Text('Daily Loss 0.8% / 3.0% max',
+          Text(
+              'Daily Loss ${trading.balance > 0 ? (trading.pnlToday.abs() / trading.balance * 100).toStringAsFixed(1) : "0.0"}% / 3.0% max',
               style: monoStyle(fontSize: 9, color: AppColors.dimText)),
         ],
       ),
@@ -394,6 +316,20 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _sniperPanel() {
+    final trading = context.watch<TradingProvider>();
+    final score = trading.sniperScore;
+
+    Color scoreColor;
+    if (score >= 80) {
+      scoreColor = AppColors.green;
+    } else if (score >= 65) {
+      scoreColor = AppColors.cyan;
+    } else if (score >= 57) {
+      scoreColor = AppColors.amber;
+    } else {
+      scoreColor = AppColors.dimText;
+    }
+
     return TerminalCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -406,28 +342,29 @@ class _DashboardScreenState extends State<DashboardScreen>
                       color: AppColors.dimText,
                       letterSpacing: 2)),
               const SizedBox(width: 8),
-              TerminalBadge(label: 'ACTIVE', color: AppColors.cyan),
+              TerminalBadge(
+                  label: trading.sniperDirection,
+                  color: trading.sniperDirection == 'BUY'
+                      ? AppColors.green
+                      : trading.sniperDirection == 'SELL'
+                          ? AppColors.red
+                          : AppColors.dimText),
             ],
           ),
           const SizedBox(height: 10),
           Row(
             children: [
-              TweenAnimationBuilder<double>(
-                tween: Tween(end: _sniperScore.toDouble()),
-                duration: const Duration(milliseconds: 600),
-                curve: Curves.easeOut,
-                builder: (_, val, __) => SizedBox(
-                  width: 60,
-                  height: 60,
-                  child: CustomPaint(
-                    painter: _ArcPainter(val.toInt(), AppColors.cyan),
-                    child: Center(
-                      child: Text('${val.toInt()}',
-                          style: monoStyle(
-                              fontSize: 20,
-                              color: AppColors.cyan,
-                              fontWeight: FontWeight.bold)),
-                    ),
+              SizedBox(
+                width: 60,
+                height: 60,
+                child: CustomPaint(
+                  painter: _ArcPainter(score.toInt(), scoreColor),
+                  child: Center(
+                    child: Text('${score.toInt()}',
+                        style: monoStyle(
+                            fontSize: 20,
+                            color: scoreColor,
+                            fontWeight: FontWeight.bold)),
                   ),
                 ),
               ),
@@ -435,53 +372,44 @@ class _DashboardScreenState extends State<DashboardScreen>
               Expanded(
                 child: Column(
                   children: [
-                    _sniperRow('Momentum', 0.78, AppColors.cyan),
+                    _infoRow('Regime', trading.regime, AppColors.cyan),
                     const SizedBox(height: 4),
-                    _sniperRow('Acceleration', 0.65, AppColors.green),
+                    _infoRow('Confidence', '${trading.regimeConfidence.toStringAsFixed(0)}%', AppColors.green),
                     const SizedBox(height: 4),
-                    _sniperRow('RSI Signal', 0.91, AppColors.amber),
+                    _infoRow('Threshold', '${trading.adaptiveThreshold.toInt()}', AppColors.amber),
                     const SizedBox(height: 4),
-                    _sniperRow('Volume', 0.54, AppColors.dimText),
+                    _infoRow('Volatility', trading.highVolatilityMode ? 'HIGH' : 'NORMAL',
+                        trading.highVolatilityMode ? AppColors.red : AppColors.dimText),
                   ],
                 ),
               ),
             ],
-          ),
-          const SizedBox(height: 8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            color: AppColors.cyan.withValues(alpha: 0.08),
-            child: Row(
-              children: [
-                const Icon(Icons.trending_up, color: AppColors.cyan, size: 14),
-                const SizedBox(width: 6),
-                Text('Signal: BUY  |  Confluence: 4/5  |  Micro-TF: BULLISH',
-                    style: monoStyle(fontSize: 9, color: AppColors.cyan)),
-              ],
-            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _sniperRow(String l, double v, Color c) {
+  Widget _infoRow(String l, String v, Color c) {
     return Row(
       children: [
         SizedBox(
             width: 80,
             child: Text(l,
                 style: monoStyle(fontSize: 9, color: AppColors.dimText))),
-        Expanded(child: MiniBar(ratio: v, color: c)),
-        const SizedBox(width: 8),
-        Text('${(v * 100).toInt()}',
-            style: monoStyle(
-                fontSize: 10, color: c, fontWeight: FontWeight.bold)),
+        Expanded(
+          child: Text(v,
+              style: monoStyle(
+                  fontSize: 10, color: c, fontWeight: FontWeight.bold)),
+        ),
       ],
     );
   }
 
   Widget _positions() {
+    final trading = context.watch<TradingProvider>();
+    final positions = trading.positions;
+
     return Container(
       decoration: BoxDecoration(
         color: AppColors.surface,
@@ -491,20 +419,43 @@ class _DashboardScreenState extends State<DashboardScreen>
         children: [
           TerminalSectionHeader(
             title: 'POSITIONS',
-            trailing: TerminalBadge(label: '2 OPEN', color: AppColors.cyan),
+            trailing: TerminalBadge(
+                label: '${positions.length} OPEN', color: AppColors.cyan),
           ),
-          _posRow('BUY', '0.15', '2,381.20', '2,378.50', _pos1Pnl,
-              AppColors.green, 'SNIPER'),
-          Container(height: 1, color: AppColors.border),
-          _posRow('SELL', '0.10', '2,389.80', '2,392.10', _pos2Pnl,
-              AppColors.red, 'MICRO_5s'),
+          if (positions.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text('No open positions',
+                  style: monoStyle(fontSize: 10, color: AppColors.dimText)),
+            ),
+          ...positions.map((pos) {
+            final isBuy = pos['type'] == 'POSITION_TYPE_BUY';
+            final pnl = (pos['profit'] as num?)?.toDouble() ?? 0.0;
+            final volume = (pos['volume'] as num?)?.toDouble() ?? 0.0;
+            final openPrice = (pos['openPrice'] as num?)?.toDouble() ?? 0.0;
+            final sl = (pos['stopLoss'] as num?)?.toDouble() ?? 0.0;
+
+            return Column(
+              children: [
+                _posRow(
+                  isBuy ? 'BUY' : 'SELL',
+                  volume.toStringAsFixed(2),
+                  openPrice.toStringAsFixed(2),
+                  sl > 0 ? sl.toStringAsFixed(2) : '--',
+                  pnl,
+                  isBuy ? AppColors.green : AppColors.red,
+                ),
+                Container(height: 1, color: AppColors.border),
+              ],
+            );
+          }),
         ],
       ),
     );
   }
 
   Widget _posRow(String type, String lots, String entry, String sl,
-      double pnl, Color c, String src) {
+      double pnl, Color c) {
     final pnlColor = pnl >= 0 ? AppColors.green : AppColors.red;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -518,27 +469,26 @@ class _DashboardScreenState extends State<DashboardScreen>
               children: [
                 Text('$lots lots @ $entry',
                     style: monoStyle(fontSize: 10, color: AppColors.text)),
-                Text('SL: $sl  |  $src',
+                Text('SL: $sl',
                     style: monoStyle(fontSize: 9, color: AppColors.dimText)),
               ],
             ),
           ),
-          TweenAnimationBuilder<double>(
-            tween: Tween(end: pnl),
-            duration: const Duration(milliseconds: 400),
-            builder: (_, val, __) => Text(
-                '${val >= 0 ? "+" : ""}\$${val.toStringAsFixed(2)}',
-                style: monoStyle(
-                    fontSize: 12,
-                    color: pnlColor,
-                    fontWeight: FontWeight.bold)),
-          ),
+          Text(
+              '${pnl >= 0 ? "+" : ""}\$${pnl.toStringAsFixed(2)}',
+              style: monoStyle(
+                  fontSize: 12,
+                  color: pnlColor,
+                  fontWeight: FontWeight.bold)),
         ],
       ),
     );
   }
 
   Widget _controls() {
+    final trading = context.watch<TradingProvider>();
+    final isRunning = trading.engineStatus == EngineStatus.running;
+
     return TerminalCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -552,115 +502,66 @@ class _DashboardScreenState extends State<DashboardScreen>
           Row(
             children: [
               Expanded(
+                child: GestureDetector(
+                  onTap: isRunning
+                      ? () => trading.stopEngine()
+                      : () => trading.startEngine(),
                   child: TerminalButton(
-                      label: 'STOP ENGINE',
-                      color: AppColors.red,
-                      icon: Icons.stop)),
-              const SizedBox(width: 8),
-              Expanded(
-                  child: TerminalButton(
-                      label: 'CLOSE ALL',
-                      color: AppColors.amber,
-                      icon: Icons.close)),
+                    label: isRunning ? 'STOP ENGINE' : 'START ENGINE',
+                    color: isRunning ? AppColors.red : AppColors.green,
+                    icon: isRunning ? Icons.stop : Icons.play_arrow,
+                  ),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 8),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 14),
-            decoration: BoxDecoration(
-              color: AppColors.red.withValues(alpha: 0.1),
-              border: Border.all(color: AppColors.red, width: 2),
-            ),
-            child: Center(
-              child: Text('EMERGENCY STOP',
-                  style: monoStyle(
-                      fontSize: 13,
-                      color: AppColors.red,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 3)),
-            ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Text('RISK',
-                  style: monoStyle(
-                      fontSize: 9,
-                      color: AppColors.dimText,
-                      letterSpacing: 1)),
-              const SizedBox(width: 12),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderThemeData(
-                    activeTrackColor: AppColors.cyan,
-                    inactiveTrackColor: AppColors.border,
-                    thumbColor: AppColors.cyan,
-                    trackHeight: 2,
-                    thumbShape:
-                        const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    overlayShape:
-                        const RoundSliderOverlayShape(overlayRadius: 12),
-                  ),
-                  child: Slider(value: 0.5, onChanged: (_) {}),
-                ),
+          GestureDetector(
+            onTap: () => _confirmEmergencyStop(context, trading),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                color: AppColors.red.withValues(alpha: 0.1),
+                border: Border.all(color: AppColors.red, width: 2),
               ),
-              Text('0.50%',
-                  style: monoStyle(
-                      fontSize: 11,
-                      color: AppColors.cyan,
-                      fontWeight: FontWeight.bold)),
-            ],
+              child: Center(
+                child: Text('EMERGENCY STOP',
+                    style: monoStyle(
+                        fontSize: 13,
+                        color: AppColors.red,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 3)),
+              ),
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _history() {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Column(
-        children: [
-          TerminalSectionHeader(
-            title: 'RECENT TRADES',
-            trailing: Text('VIEW ALL >',
-                style: monoStyle(fontSize: 9, color: AppColors.cyan)),
+  void _confirmEmergencyStop(BuildContext context, TradingProvider trading) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('EMERGENCY STOP',
+            style: monoStyle(fontSize: 14, color: AppColors.red, fontWeight: FontWeight.bold)),
+        content: Text(
+            'Close ALL positions and stop the engine immediately?',
+            style: monoStyle(fontSize: 11, color: AppColors.text)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('CANCEL', style: monoStyle(fontSize: 11, color: AppColors.dimText)),
           ),
-          _tradeRow('14:23', 'BUY', '0.12', '+\$45.20', true),
-          Container(height: 1, color: AppColors.border),
-          _tradeRow('14:18', 'SELL', '0.08', '-\$12.80', false),
-          Container(height: 1, color: AppColors.border),
-          _tradeRow('14:05', 'BUY', '0.15', '+\$78.40', true),
-        ],
-      ),
-    );
-  }
-
-  Widget _tradeRow(String t, String ty, String l, String p, bool w) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Row(
-        children: [
-          Text(t, style: monoStyle(fontSize: 10, color: AppColors.dimText)),
-          const SizedBox(width: 8),
-          Text(ty,
-              style: monoStyle(
-                  fontSize: 10,
-                  color: ty == 'BUY' ? AppColors.green : AppColors.red,
-                  fontWeight: FontWeight.bold)),
-          const SizedBox(width: 8),
-          Text('$l lots',
-              style: monoStyle(fontSize: 10, color: AppColors.text)),
-          const Spacer(),
-          Text(p,
-              style: monoStyle(
-                  fontSize: 11,
-                  color: w ? AppColors.green : AppColors.red,
-                  fontWeight: FontWeight.bold)),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              trading.emergencyStop();
+            },
+            child: Text('CONFIRM', style: monoStyle(fontSize: 11, color: AppColors.red, fontWeight: FontWeight.bold)),
+          ),
         ],
       ),
     );

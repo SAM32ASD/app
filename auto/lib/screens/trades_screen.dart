@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/terminal_card.dart';
+import '../providers/trade_history_provider.dart';
+import '../providers/trading_provider.dart';
 
 class TradesScreen extends StatefulWidget {
   const TradesScreen({super.key});
@@ -12,56 +15,90 @@ class TradesScreen extends StatefulWidget {
 class _TradesScreenState extends State<TradesScreen> {
   String _filter = 'ALL';
 
-  final _trades = [
-    _Trade('14:23', 'BUY', 0.12, 2381.20, 2386.40, 45.20, true, 'SNIPER', 0),
-    _Trade('14:18', 'SELL', 0.08, 2389.80, 2391.60, -12.80, false, 'M1', 0),
-    _Trade('14:05', 'BUY', 0.15, 2376.50, 2381.70, 78.40, true, 'MICRO_5s', 1),
-    _Trade('13:52', 'SELL', 0.10, 2392.10, 2388.30, 38.00, true, 'SNIPER', 0),
-    _Trade('13:41', 'BUY', 0.20, 2370.80, 2368.50, -46.00, false, 'M5', 2),
-    _Trade('13:30', 'BUY', 0.12, 2368.40, 2374.20, 69.60, true, 'SNIPER', 0),
-    _Trade('13:15', 'SELL', 0.08, 2380.50, 2382.10, -12.80, false, 'MICRO_10s', 0),
-    _Trade('12:58', 'BUY', 0.15, 2365.20, 2371.80, 99.00, true, 'SNIPER', 1),
-    _Trade('12:42', 'SELL', 0.10, 2375.60, 2372.40, 32.00, true, 'M1', 0),
-    _Trade('12:30', 'BUY', 0.12, 2362.80, 2360.50, -27.60, false, 'M5', 0),
-  ];
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<TradeHistoryProvider>().loadTrades(refresh: true);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
+    final historyProvider = context.watch<TradeHistoryProvider>();
+    final trading = context.watch<TradingProvider>();
+    final trades = historyProvider.trades;
+
     final filtered = _filter == 'ALL'
-        ? _trades
+        ? trades
         : _filter == 'WIN'
-            ? _trades.where((t) => t.win).toList()
-            : _trades.where((t) => !t.win).toList();
+            ? trades.where((t) => (t['profit'] as num? ?? 0) > 0).toList()
+            : trades.where((t) => (t['profit'] as num? ?? 0) <= 0).toList();
 
     return Column(
       children: [
-        _summary(),
+        _summary(trading, trades),
         const SizedBox(height: 8),
         _filterRow(),
         const SizedBox(height: 4),
         Expanded(
-          child: ListView.separated(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            itemCount: filtered.length,
-            separatorBuilder: (_, __) => const SizedBox(height: 6),
-            itemBuilder: (_, i) => _tradeCard(filtered[i]),
-          ),
+          child: historyProvider.isLoading && trades.isEmpty
+              ? const Center(
+                  child: CircularProgressIndicator(
+                      color: AppColors.cyan, strokeWidth: 2))
+              : RefreshIndicator(
+                  onRefresh: () =>
+                      historyProvider.loadTrades(refresh: true),
+                  color: AppColors.cyan,
+                  child: ListView.separated(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    itemCount: filtered.length + (historyProvider.hasMore ? 1 : 0),
+                    separatorBuilder: (_, __) => const SizedBox(height: 6),
+                    itemBuilder: (_, i) {
+                      if (i >= filtered.length) {
+                        historyProvider.loadMore();
+                        return const Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Center(
+                            child: CircularProgressIndicator(
+                                color: AppColors.cyan, strokeWidth: 2),
+                          ),
+                        );
+                      }
+                      return _tradeCard(filtered[i]);
+                    },
+                  ),
+                ),
         ),
       ],
     );
   }
 
-  Widget _summary() {
+  Widget _summary(TradingProvider trading, List<Map<String, dynamic>> trades) {
+    final wins = trades.where((t) => (t['profit'] as num? ?? 0) > 0).length;
+    final losses = trades.where((t) => (t['profit'] as num? ?? 0) <= 0).length;
+    final netPl = trades.fold<double>(
+        0, (sum, t) => sum + ((t['profit'] as num?)?.toDouble() ?? 0));
+    final avgWin = wins > 0
+        ? trades
+                .where((t) => (t['profit'] as num? ?? 0) > 0)
+                .fold<double>(0, (s, t) => s + ((t['profit'] as num?)?.toDouble() ?? 0)) /
+            wins
+        : 0.0;
+
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
       child: TerminalCard(
         child: Row(
           children: [
-            _summaryCol('TOTAL', '25', AppColors.text),
-            _summaryCol('WINS', '17', AppColors.green),
-            _summaryCol('LOSSES', '8', AppColors.red),
-            _summaryCol('NET P&L', '+\$847', AppColors.green),
-            _summaryCol('AVG WIN', '+\$52', AppColors.cyan),
+            _summaryCol('TOTAL', '${trades.length}', AppColors.text),
+            _summaryCol('WINS', '$wins', AppColors.green),
+            _summaryCol('LOSSES', '$losses', AppColors.red),
+            _summaryCol('NET P&L',
+                '${netPl >= 0 ? "+" : ""}\$${netPl.toStringAsFixed(0)}',
+                netPl >= 0 ? AppColors.green : AppColors.red),
+            _summaryCol('AVG WIN', '+\$${avgWin.toStringAsFixed(0)}', AppColors.cyan),
           ],
         ),
       ),
@@ -109,11 +146,8 @@ class _TradesScreenState extends State<TradesScreen> {
                   child: Text(f,
                       style: monoStyle(
                           fontSize: 10,
-                          color:
-                              active ? AppColors.cyan : AppColors.dimText,
-                          fontWeight: active
-                              ? FontWeight.bold
-                              : FontWeight.normal,
+                          color: active ? AppColors.cyan : AppColors.dimText,
+                          fontWeight: active ? FontWeight.bold : FontWeight.normal,
                           letterSpacing: 1)),
                 ),
               ),
@@ -124,42 +158,50 @@ class _TradesScreenState extends State<TradesScreen> {
     );
   }
 
-  Widget _tradeCard(_Trade tr) {
-    final typeColor = tr.type == 'BUY' ? AppColors.green : AppColors.red;
+  Widget _tradeCard(Map<String, dynamic> trade) {
+    final type = (trade['type'] as String?) ?? 'BUY';
+    final profit = (trade['profit'] as num?)?.toDouble() ?? 0.0;
+    final win = profit > 0;
+    final lots = (trade['volume'] as num?)?.toDouble() ?? 0.0;
+    final entry = (trade['openPrice'] as num?)?.toDouble() ?? 0.0;
+    final exit = (trade['closePrice'] as num?)?.toDouble() ?? 0.0;
+    final source = (trade['comment'] as String?) ?? '';
+    final time = (trade['closeTime'] as String?) ?? '';
+
+    final typeColor = type.contains('BUY') ? AppColors.green : AppColors.red;
+
     return TerminalCard(
       child: Column(
         children: [
           Row(
             children: [
-              TerminalBadge(label: tr.type, color: typeColor),
+              TerminalBadge(
+                  label: type.contains('BUY') ? 'BUY' : 'SELL',
+                  color: typeColor),
               const SizedBox(width: 8),
-              Text('${tr.lots} lots',
+              Text('${lots.toStringAsFixed(2)} lots',
                   style: monoStyle(fontSize: 10, color: AppColors.text)),
               const SizedBox(width: 8),
-              TerminalBadge(label: tr.source, color: AppColors.cyan),
-              if (tr.gridIdx > 0) ...[
-                const SizedBox(width: 4),
-                TerminalBadge(
-                    label: 'GRID #${tr.gridIdx}', color: AppColors.amber),
-              ],
+              if (source.isNotEmpty)
+                TerminalBadge(label: source.split(' ').first, color: AppColors.cyan),
               const Spacer(),
-              Text(tr.time,
+              Text(time.length >= 16 ? time.substring(11, 16) : time,
                   style: monoStyle(fontSize: 10, color: AppColors.dimText)),
             ],
           ),
           const SizedBox(height: 8),
           Row(
             children: [
-              _tradeDetail('ENTRY', tr.entry.toStringAsFixed(2)),
-              _tradeDetail('EXIT', tr.exit.toStringAsFixed(2)),
+              _tradeDetail('ENTRY', entry.toStringAsFixed(2)),
+              _tradeDetail('EXIT', exit.toStringAsFixed(2)),
               _tradeDetail(
                   'P&L',
-                  '${tr.win ? "+" : ""}\$${tr.pnl.toStringAsFixed(2)}',
-                  color: tr.win ? AppColors.green : AppColors.red),
+                  '${win ? "+" : ""}\$${profit.toStringAsFixed(2)}',
+                  color: win ? AppColors.green : AppColors.red),
               _tradeDetail(
                   'PIPS',
-                  '${((tr.exit - tr.entry) * 10).abs().toStringAsFixed(1)}',
-                  color: tr.win ? AppColors.green : AppColors.red),
+                  '${((exit - entry).abs() / 0.01).toStringAsFixed(0)}',
+                  color: win ? AppColors.green : AppColors.red),
             ],
           ),
         ],
@@ -182,14 +224,4 @@ class _TradesScreenState extends State<TradesScreen> {
       ),
     );
   }
-}
-
-class _Trade {
-  final String time, type, source;
-  final double lots, entry, exit, pnl;
-  final bool win;
-  final int gridIdx;
-
-  _Trade(this.time, this.type, this.lots, this.entry, this.exit, this.pnl,
-      this.win, this.source, this.gridIdx);
 }

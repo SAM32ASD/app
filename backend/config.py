@@ -21,11 +21,19 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret-change-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 1440
+    jwt_refresh_secret: str = "dev-refresh-secret-change-in-production"
+    jwt_refresh_expire_days: int = 7
+
+    encryption_key: str = ""
 
     cors_origins: list[str] = ["*"]
 
+    rate_limit_requests: int = 10
+    rate_limit_window_seconds: int = 60
+
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 @lru_cache()

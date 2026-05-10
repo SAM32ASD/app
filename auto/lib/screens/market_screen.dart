@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/terminal_card.dart';
+import '../providers/market_provider.dart';
 
 class MarketScreen extends StatelessWidget {
   const MarketScreen({super.key});
@@ -31,54 +33,63 @@ class MarketScreen extends StatelessWidget {
   }
 
   Widget _priceHeader() {
-    return TerminalCard(
-      child: Row(
-        children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('XAUUSD',
-                  style: monoStyle(
-                      fontSize: 10,
-                      color: AppColors.dimText,
-                      letterSpacing: 2)),
-              const SizedBox(height: 4),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Text('2,387',
-                      style: monoStyle(
-                          fontSize: 28,
-                          color: Colors.white,
-                          fontWeight: FontWeight.w300)),
-                  Text('.45',
-                      style: monoStyle(
-                          fontSize: 18,
-                          color: AppColors.cyan,
-                          fontWeight: FontWeight.bold)),
-                ],
-              ),
-            ],
-          ),
-          const Spacer(),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                color: AppColors.green.withValues(alpha: 0.15),
-                child: Text('+0.52%',
-                    style: monoStyle(fontSize: 11, color: AppColors.green)),
-              ),
-              const SizedBox(height: 4),
-              Text('Spread: 0.06',
-                  style: monoStyle(fontSize: 9, color: AppColors.dimText)),
-            ],
-          ),
-        ],
-      ),
-    );
+    return Builder(builder: (context) {
+      final market = context.watch<MarketProvider>();
+      final bid = market.bid;
+      final spread = market.spread;
+      final priceStr = bid > 0 ? bid.toStringAsFixed(2) : '-----.--';
+      final wholePart = priceStr.split('.')[0];
+      final decPart = priceStr.split('.').length > 1 ? '.${priceStr.split('.')[1]}' : '';
+
+      return TerminalCard(
+        child: Row(
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('XAUUSD',
+                    style: monoStyle(
+                        fontSize: 10,
+                        color: AppColors.dimText,
+                        letterSpacing: 2)),
+                const SizedBox(height: 4),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(wholePart,
+                        style: monoStyle(
+                            fontSize: 28,
+                            color: Colors.white,
+                            fontWeight: FontWeight.w300)),
+                    Text(decPart,
+                        style: monoStyle(
+                            fontSize: 18,
+                            color: AppColors.cyan,
+                            fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ],
+            ),
+            const Spacer(),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  color: AppColors.green.withValues(alpha: 0.15),
+                  child: Text(market.volatilityStatus,
+                      style: monoStyle(fontSize: 11, color: AppColors.green)),
+                ),
+                const SizedBox(height: 4),
+                Text('Spread: ${spread.toStringAsFixed(2)}',
+                    style: monoStyle(fontSize: 9, color: AppColors.dimText)),
+              ],
+            ),
+          ],
+        ),
+      );
+    });
   }
 
   Widget _chartPlaceholder() {

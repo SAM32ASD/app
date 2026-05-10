@@ -7,8 +7,11 @@ from enum import Enum
 class SLMethod(str, Enum):
     ATR_ADAPTIVE = "atr_adaptive"
     SWING_POINTS = "swing_points"
+    SWINGS = "swings"
     SUPPORT_RESISTANCE = "support_resistance"
+    SR = "sr"
     HYBRID = "hybrid"
+    FIXED = "fixed"
 
 
 class RobotStatus(str, Enum):
@@ -45,6 +48,8 @@ class TradingConfigSchema(BaseModel):
 
 
 class TradingConfigUpdate(BaseModel):
+    model_config = {"extra": "allow"}
+
     risk_percent: float | None = None
     max_daily_loss_percent: float | None = None
     max_consecutive_losses: int | None = None

@@ -10,9 +10,12 @@ class DynamicSLCalculator:
         self.atr_min_multiplier: float = cfg.get("sl_atr_min_multiplier", 0.4)
         self.atr_max_multiplier: float = cfg.get("sl_atr_max_multiplier", 1.0)
         self.swing_lookback: int = cfg.get("sl_swing_lookback", 10)
-        self.min_distance: int = cfg.get("sl_min_distance", 30)
-        self.max_distance: int = cfg.get("sl_max_distance", 180)
+        self.sl_min: float = cfg.get("sl_min", 30.0)
+        self.sl_max: float = cfg.get("sl_max", 180.0)
         self.use_volatility_adjustment: bool = cfg.get("sl_use_volatility_adjustment", True)
+
+        self.weak_signal_atr_multiplier: float = cfg.get("weak_signal_atr_multiplier", 1.3)
+        self.strong_signal_reduction: float = cfg.get("strong_signal_reduction", 0.15)
 
     def calculate(
         self,
@@ -20,6 +23,7 @@ class DynamicSLCalculator:
         entry_price: float,
         atr_value: float,
         point: float,
+        sniper_score: float = 70.0,
         current_volatility: float = 0.0,
         average_volatility: float = 0.0,
         high_volatility_mode: bool = False,
@@ -27,13 +31,74 @@ class DynamicSLCalculator:
         recent_highs: list[float] | None = None,
         supports: list[float] | None = None,
         resistances: list[float] | None = None,
+    ) -> tuple[float, str]:
+        """Returns (sl_distance, method_used)."""
+
+        sl_mode = self._get_sl_mode(sniper_score)
+
+        if sl_mode == "conservative":
+            sl_distance = self._calculate_conservative(atr_value, current_volatility, average_volatility)
+            method_used = f"atr_conservative(x{self.weak_signal_atr_multiplier})"
+        elif sl_mode == "aggressive":
+            sl_distance = self._calculate_standard(
+                is_buy, entry_price, atr_value, point,
+                current_volatility, average_volatility, high_volatility_mode,
+                recent_lows, recent_highs, supports, resistances,
+            )
+            sl_distance *= (1.0 - self.strong_signal_reduction)
+            method_used = f"{self.method}_aggressive(-{int(self.strong_signal_reduction*100)}%)"
+        else:
+            sl_distance = self._calculate_standard(
+                is_buy, entry_price, atr_value, point,
+                current_volatility, average_volatility, high_volatility_mode,
+                recent_lows, recent_highs, supports, resistances,
+            )
+            method_used = f"{self.method}_standard"
+
+        sl_min_price = self.sl_min * point
+        sl_max_price = self.sl_max * point
+
+        if sl_distance < sl_min_price:
+            logger.warning(f"SL {sl_distance/point:.1f}pts < sl_min {self.sl_min}pts, clamping to min")
+            sl_distance = sl_min_price
+        elif sl_distance > sl_max_price:
+            logger.warning(f"SL {sl_distance/point:.1f}pts > sl_max {self.sl_max}pts, clamping to max")
+            sl_distance = sl_max_price
+
+        return sl_distance, method_used
+
+    def _get_sl_mode(self, score: float) -> str:
+        if score < 65:
+            return "conservative"
+        elif score >= 80:
+            return "aggressive"
+        return "standard"
+
+    def _calculate_conservative(
+        self, atr_value: float, current_vol: float, average_vol: float
+    ) -> float:
+        if atr_value <= 0:
+            return 0.0
+        return atr_value * self.weak_signal_atr_multiplier
+
+    def _calculate_standard(
+        self,
+        is_buy: bool,
+        entry_price: float,
+        atr_value: float,
+        point: float,
+        current_volatility: float,
+        average_volatility: float,
+        high_volatility_mode: bool,
+        recent_lows: list[float] | None,
+        recent_highs: list[float] | None,
+        supports: list[float] | None,
+        resistances: list[float] | None,
     ) -> float:
         sl_distance = 0.0
 
         if self.method in ("atr_adaptive", "hybrid"):
-            sl_distance = self._sl_atr_adaptive(
-                atr_value, current_volatility, average_volatility
-            )
+            sl_distance = self._sl_atr_adaptive(atr_value, current_volatility, average_volatility)
 
         if self.method in ("swing_points", "hybrid"):
             swing_sl = self._sl_by_swings(
@@ -53,9 +118,6 @@ class DynamicSLCalculator:
             sl_distance = self._adjust_by_volatility(
                 sl_distance, current_volatility, average_volatility, high_volatility_mode
             )
-
-        sl_distance = max(sl_distance, self.min_distance * point)
-        sl_distance = min(sl_distance, self.max_distance * point)
 
         return sl_distance
 
@@ -82,12 +144,12 @@ class DynamicSLCalculator:
         recent_lows: list[float], recent_highs: list[float]
     ) -> float:
         if is_buy and recent_lows:
-            lowest = min(recent_lows[:self.swing_lookback]) if recent_lows else 0
+            lowest = min(recent_lows[:self.swing_lookback])
             if lowest > 0:
                 buffer = (entry_price - lowest) * 0.1
                 return (entry_price - lowest) + buffer
         elif not is_buy and recent_highs:
-            highest = max(recent_highs[:self.swing_lookback]) if recent_highs else 0
+            highest = max(recent_highs[:self.swing_lookback])
             if highest > 0:
                 buffer = (highest - entry_price) * 0.1
                 return (highest - entry_price) + buffer
@@ -97,21 +159,21 @@ class DynamicSLCalculator:
         self, is_buy: bool, entry_price: float,
         supports: list[float], resistances: list[float], point: float
     ) -> float:
-        nearest = 0.0
         min_dist = float("inf")
+        nearest = 0.0
 
         if is_buy:
             for s in supports:
                 if s < entry_price:
                     dist = entry_price - s
-                    if dist < min_dist and dist > self.min_distance * point:
+                    if dist < min_dist and dist > self.sl_min * point:
                         min_dist = dist
                         nearest = s
         else:
             for r in resistances:
                 if r > entry_price:
                     dist = r - entry_price
-                    if dist < min_dist and dist > self.min_distance * point:
+                    if dist < min_dist and dist > self.sl_min * point:
                         min_dist = dist
                         nearest = r
 
